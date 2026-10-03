@@ -66,6 +66,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# `pwsh -File ship.ps1 -Only a,b` passes one string, so a comma list is split here.
+$Only = @($Only | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+$Skip = @($Skip | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $script:Root = Split-Path -Parent $PSScriptRoot
 $script:Dist = Join-Path $script:Root 'dist'
 . (Join-Path $PSScriptRoot 'common.ps1')
