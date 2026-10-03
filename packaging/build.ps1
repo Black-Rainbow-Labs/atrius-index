@@ -81,7 +81,17 @@ try {
         $arguments += @('--manifest-path', $manifest, '--release', '--locked', '--target', $entry.Build, '--target-dir', $targetDir, '-p', 'atrius-cli')
         if ($entry.Triple -like '*apple*') {
             # Room for the code signature load command; without it rcodesign refuses the x86-64 slice.
-            $arguments += @('--config', "target.$($entry.Triple).rustflags=[`"-C`",`"link-arg=-Wl,-headerpad_max_install_names`"]")
+            # Set through the environment because Start-Process drops the quotes a --config value needs.
+            $variable = 'CARGO_TARGET_' + $entry.Triple.ToUpper().Replace('-', '_') + '_RUSTFLAGS'
+            Set-Item -Path "env:$variable" -Value '-C link-arg=-Wl,-headerpad_max_install_names'
+            # The file watcher uses FSEvents, so the programs link CoreFoundation and CoreServices, which
+            # zig does not carry. Apple's SDK, copied to this machine for Unluminous's release, supplies
+            # them; ATRIUS_MACOS_SDK names another copy.
+            $sdk = if ($env:ATRIUS_MACOS_SDK) { $env:ATRIUS_MACOS_SDK } else { 'J:\mac-sdk\MacOSX.sdk' }
+            if (-not (Test-Path -LiteralPath (Join-Path $sdk 'System/Library/Frameworks/CoreServices.framework'))) {
+                throw "the macOS SDK is not at $sdk; set ATRIUS_MACOS_SDK to a copy of MacOSX.sdk"
+            }
+            $env:SDKROOT = $sdk
         }
         Write-Host "== building $($entry.Triple)"
         $process = Start-Process -FilePath $program -ArgumentList $arguments -NoNewWindow -PassThru `

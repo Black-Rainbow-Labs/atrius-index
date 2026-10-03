@@ -80,7 +80,9 @@ function Invoke-Rcodesign {
     $err = [System.IO.Path]::GetTempFileName()
     try {
         $where = if ($WorkingDirectory) { $WorkingDirectory } else { (Get-Location).Path }
-        $process = Start-Process -FilePath $rcodesign -ArgumentList $Arguments -WorkingDirectory $where `
+        # Start-Process joins the list with spaces, so an argument holding a space is quoted here.
+        $quoted = @($Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } })
+        $process = Start-Process -FilePath $rcodesign -ArgumentList $quoted -WorkingDirectory $where `
             -Wait -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
         if ($process.ExitCode -ne 0) { throw "rcodesign $($Arguments[0]) failed with $($process.ExitCode): $(Get-Content -LiteralPath $err -Raw)" }
         return (Get-Content -LiteralPath $out, $err)
@@ -105,9 +107,9 @@ function Assert-SignedUniversal {
         if ($found -ne $expectedMinimumOs) { throw "$Path slice $index declares macOS $found; this release states $expectedMinimumOs" }
     }
     $info = & $rcodesign print-signature-info $Path 2>&1
-    if (($info | Select-String -Pattern 'CodeSignatureFlags\(RUNTIME\)').Count -lt 2) { throw "$Path: not every slice has the hardened runtime" }
-    if (($info | Select-String -Pattern 'com\.apple\.security\.cs\.disable-library-validation').Count -lt 4) { throw "$Path: not every slice carries the entitlement" }
-    if (-not ($info | Select-String -Pattern 'time_stamp_token')) { throw "$Path carries no trusted timestamp" }
+    if (($info | Select-String -Pattern 'CodeSignatureFlags\(RUNTIME\)').Count -lt 2) { throw "${Path}: not every slice has the hardened runtime" }
+    if (($info | Select-String -Pattern 'com\.apple\.security\.cs\.disable-library-validation').Count -lt 4) { throw "${Path}: not every slice carries the entitlement" }
+    if (-not ($info | Select-String -Pattern 'time_stamp_token')) { throw "${Path} carries no trusted timestamp" }
 }
 
 function New-SelfSignedIdentity {
@@ -125,7 +127,7 @@ function New-SelfSignedIdentity {
 
 $dist = if ($SelfSigned) { Join-Path $root 'dist/unpublishable' } else { Join-Path $root 'dist' }
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
-Write-Host "Atrius $Version: macOS, signed on Windows"
+Write-Host "Atrius ${Version}: macOS, signed on Windows"
 
 if (-not $SelfSigned) {
     $present = Test-AppleCredentials

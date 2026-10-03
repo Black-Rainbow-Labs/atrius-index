@@ -49,9 +49,9 @@ fi
 
 # 4. install.sh on Linux, in WSL, into a scratch home.
 if command -v wsl.exe >/dev/null 2>&1; then
-  out="$(wsl.exe -e bash -lc "export HOME=\$(mktemp -d); curl -fsSL $base/install.sh | sh -s -- --version $version >/dev/null && \$HOME/.local/bin/atrius --version && mkdir -p \$HOME/p/src && printf 'fn retry_write() {}\n' > \$HOME/p/src/lib.rs && cd \$HOME/p && git init -q && ATRIUS_INDEX_CACHE=\$HOME/c \$HOME/.local/bin/atrius find retry_write && ATRIUS_INDEX_CACHE=\$HOME/c \$HOME/.local/bin/atrius stop" 2>&1)"
+  out="$(wsl.exe -e bash -lc "export HOME=\$(mktemp -d); curl -fsSL $base/install.sh | sh -s -- --version $version >/dev/null && \$HOME/.local/bin/atrius --version && mkdir -p \$HOME/p/src && printf 'fn retry_write() {}\n' > \$HOME/p/src/lib.rs && git init -q \$HOME/p && ATRIUS_INDEX_CACHE=\$HOME/c \$HOME/.local/bin/atrius find retry_write --root \$HOME/p && ATRIUS_INDEX_CACHE=\$HOME/c \$HOME/.local/bin/atrius stop --root \$HOME/p" 2>&1)"
   echo "$out" | grep -q "atrius $version" && echo "$out" | grep -q "src/lib.rs" && ok "install.sh in WSL, and a search" || fail "install.sh in WSL: $out"
-  out="$(wsl.exe -e bash -lc "d=\$(mktemp -d) && cd \$d && curl -fsSL -O $base/atrius-index_${version}_amd64.deb && dpkg-deb -x atrius-index_${version}_amd64.deb root && ./root/usr/bin/atrius --version" 2>&1)"
+  out="$(wsl.exe -e bash -lc "d=\$(mktemp -d) && curl -fsSL -o \$d/a.deb $base/atrius-index_${version}_amd64.deb && dpkg-deb -x \$d/a.deb \$d/root && \$d/root/usr/bin/atrius --version" 2>&1)"
   echo "$out" | grep -q "atrius $version" && ok ".deb unpacks and runs in WSL" || fail ".deb in WSL: $out"
 else
   skip "no WSL for install.sh and the .deb"
