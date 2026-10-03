@@ -270,8 +270,9 @@ function Get-Routes {
                 if ($why) { return $why }
                 foreach ($file in (Get-ReleaseAssets -Version $Version)) {
                     $name = Split-Path -Leaf $file
-                    try { $head = Invoke-WebRequest -Uri "$($script:BaseUrl)/$name" -Method Head -UseBasicParsing } catch { return "$name : $($_.Exception.Message)" }
-                    $size = [int64]($head.Headers['Content-Length'] | Select-Object -First 1)
+                    # The bytes fetched, rather than a Content-Length: the edge answers a text file
+                    # compressed, with no length header at all.
+                    $size = [int64](& curl.exe -sL -o NUL -w '%{size_download}' "$($script:BaseUrl)/$name")
                     if ($size -ne (Get-Item -LiteralPath $file).Length) { return "$name is served at $size bytes and is $((Get-Item -LiteralPath $file).Length)" }
                 }
                 $null
