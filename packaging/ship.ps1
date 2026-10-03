@@ -72,6 +72,8 @@ $script:Dist = Join-Path $script:Root 'dist'
 . (Join-Path $PSScriptRoot 'macos/apple-credentials.ps1')
 . (Join-Path $PSScriptRoot 'github-token.ps1')
 $script:CrossBin = Get-CrossBin -Root $script:Root
+$script:Zigbuild = Join-Path $script:CrossBin 'cargo-zigbuild.exe'
+$script:Minisign = Join-Path $script:CrossBin 'minisign.exe'
 if (-not $SitesRoot) { $SitesRoot = Join-Path (Split-Path -Parent $script:Root) 'black-rainbow-labs-sites' }
 if (-not $TapPath) { $TapPath = Join-Path (Split-Path -Parent $script:Root) 'homebrew-atrius' }
 $script:SitesRoot = $SitesRoot
@@ -203,11 +205,11 @@ function Get-Routes {
         The version being released.
     #>
     param([string] $Version)
-    $zigbuild = Join-Path $script:CrossBin 'cargo-zigbuild.exe'
-    $minisign = Join-Path $script:CrossBin 'minisign.exe'
+
+
     return @(
         @{ Name = 'build'
-            Needs = { if (-not (Test-Path -LiteralPath $zigbuild)) { return "cargo-zigbuild is not in $($script:CrossBin)" }; $null }
+            Needs = { if (-not (Test-Path -LiteralPath $script:Zigbuild)) { return "cargo-zigbuild is not in $($script:CrossBin)" }; $null }
             Run = { & (Join-Path $PSScriptRoot 'build.ps1') -Version $Version -Targets all }
             Verify = { foreach ($t in 'x86_64-pc-windows-msvc.zip', 'x86_64-unknown-linux-gnu.tar.gz', 'aarch64-unknown-linux-gnu.tar.gz') { if (-not (Test-Path -LiteralPath (Join-Path $script:Dist "atrius-index-$Version-$t"))) { return "atrius-index-$Version-$t was not written" } }; $null } },
         @{ Name = 'macos'
@@ -219,15 +221,15 @@ function Get-Routes {
             Run = { & (Join-Path $PSScriptRoot 'linux/package-linux.ps1') -Version $Version }
             Verify = { if (-not (Test-Path -LiteralPath (Join-Path $script:Dist "atrius-index_${Version}_amd64.deb"))) { return 'the .deb was not written' }; $null } },
         @{ Name = 'sign'
-            Needs = { if (-not (Test-Path -LiteralPath $minisign)) { return 'minisign is missing' }; if (-not $env:INILLUCENT_MINISIGN_KEY) { return 'no minisign key' }; $null }
+            Needs = { if (-not (Test-Path -LiteralPath $script:Minisign)) { return 'minisign is missing' }; if (-not $env:INILLUCENT_MINISIGN_KEY) { return 'no minisign key' }; $null }
             Run = {
                 $sums = Update-Sha256Sums -Dist $script:Dist -Version $Version
                 Remove-Item -LiteralPath "$sums.minisig" -Force -Confirm:$false -ErrorAction SilentlyContinue
                 $comment = "atrius-index $Version, signed on $(Get-Date -Format 'yyyy-MM-dd')"
-                $env:INILLUCENT_MINISIGN_PASSPHRASE | & $minisign -S -s $env:INILLUCENT_MINISIGN_KEY -m $sums -c $comment -t $comment
+                $env:INILLUCENT_MINISIGN_PASSPHRASE | & $script:Minisign -S -s $env:INILLUCENT_MINISIGN_KEY -m $sums -c $comment -t $comment
                 if ($LASTEXITCODE -ne 0) { throw "minisign failed with $LASTEXITCODE" }
             }
-            Verify = { & $minisign -V -p (Join-Path $PSScriptRoot 'atrius-index.pub') -m (Join-Path $script:Dist 'SHA256SUMS') | Out-Null; if ($LASTEXITCODE -ne 0) { return 'the signature does not verify' }; $null } },
+            Verify = { & $script:Minisign -V -p (Join-Path $PSScriptRoot 'atrius-index.pub') -m (Join-Path $script:Dist 'SHA256SUMS') | Out-Null; if ($LASTEXITCODE -ne 0) { return 'the signature does not verify' }; $null } },
         @{ Name = 'tag'
             Needs = { $null }
             Run = {
@@ -315,13 +317,13 @@ function Get-Routes {
 }
 
 # ---------------------------------------------------------------------------
-$current = Get-WorkspaceVersion -Root $script:Root
-if (-not $Version) { $Version = if ($Current) { $current } else { Step-Version -From $current -Which $Part } }
-if ([version]$Version -lt [version]$current) { throw "$Version is older than the checkout's $current" }
+$checkoutVersion = Get-WorkspaceVersion -Root $script:Root
+if (-not $Version) { $Version = if ($Current) { $checkoutVersion } else { Step-Version -From $checkoutVersion -Which $Part } }
+if ([version]$Version -lt [version]$checkoutVersion) { throw "$Version is older than the checkout's $checkoutVersion" }
 $dirty = & git -C $script:Root status --porcelain
 if ($dirty -and -not $WhatIf) { throw "the working tree is not clean:`n$($dirty -join "`n")" }
 
-Write-Host "Atrius $Version (the checkout says $current)"
+Write-Host "Atrius $Version (the checkout says $checkoutVersion)"
 Import-Secrets
 $outcomes = [ordered]@{}
 try {
@@ -336,7 +338,7 @@ try {
     }
     if ($WhatIf) { return }
 
-    if ($Version -ne $current) {
+    if ($Version -ne $checkoutVersion) {
         Write-Host '== version'
         Set-ReleaseVersion -New $Version
     }
