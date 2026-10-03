@@ -321,3 +321,22 @@ and `every_catalogue_command_is_driven_both_ways`) must pass with the crate repl
 Releases are verified by installing them: `packaging/verify-installs.sh` fetches from
 blackrainbowlabs.com, runs `install.sh` and the `.deb` in WSL Ubuntu, runs `install.ps1` into a scratch
 folder, and compares the Homebrew formula's checksums with the published `SHA256SUMS`.
+
+## What changed during implementation
+
+| Planned | Built | Why |
+|---|---|---|
+| 16 corpora | 19 corpora in 13 languages, 67 to 89,668 files, pinned to release tags | Lua, Zig and Scala were added so every bundled C family and functional language has one |
+| Delete `crates/unluminous-index` | Removed from the Unluminous workspace and no longer built; the files are left for a person to delete | Agents do not delete files they did not create |
+| Daemon lets go of a removed folder | The daemon restarts itself (exit 3 under systemd or launchd, a detached copy otherwise) | A host holds its folder's lock for the life of its process |
+| Verbs refuse while the index builds | Verbs other than `find` wait up to 30 s (`ATRIUS_READY_WAIT_SECONDS`) | The MCP test found `def` refused right after the server started |
+| `find` keeps `--glob` for uses | Also for the definitions it lists first | The MCP test found a Rust definition listed for `--glob *.py` |
+| | C functions written `name (args)` are definitions; `examples/`, `playground/`, `docs/` rank after source | Found by the Lua and vite corpora |
+| | The corpus test is `#[ignore]` and runs with `--ignored` in a release build | It reads gigabytes of source |
+| | macOS builds link with the SDK at `J:\mac-sdk` | The watcher uses FSEvents, which needs CoreFoundation and CoreServices |
+
+**A measured finding for a follow up:** the full index file is 5 to 8 times the source on large
+repositories (Go: 170 MB of source, 1.1 GB index; Linux: 1.6 GB, 13.4 GB). The text, compressed, and
+the trigram lists are 70 MB of Go's file; the passage table's search structures inside Inillucent are
+about 920 MB. Making the passage table smaller or optional is recommended in Atrius's
+`docs/performance.md`.
