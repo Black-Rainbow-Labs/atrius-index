@@ -283,6 +283,8 @@ function Get-Routes {
         @{ Name = 'crates'
             Needs = { if (-not $env:CARGO_REGISTRY_TOKEN) { return 'no crates.io token' }; $null }
             Run = {
+                # cargo publish builds the crates to check them, and onig_sys needs the MSVC environment.
+                Import-MsvcEnvironment
                 foreach ($crate in 'atrius-index', 'atrius-cli') {
                     $published = $false
                     try { $published = ((Invoke-WebRequest -Uri "https://crates.io/api/v1/crates/$crate/$Version" -UseBasicParsing -UserAgent 'atrius-ship').StatusCode -eq 200) } catch {}
