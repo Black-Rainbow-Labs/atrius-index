@@ -39,7 +39,9 @@ done < <(tr -d '\r' < "$work/SHA256SUMS")
 # 3. The signature over SHA256SUMS verifies with the published key.
 curl -fsSL "$base/SHA256SUMS.minisig" -o "$work/SHA256SUMS.minisig" || fail "SHA256SUMS.minisig is not served"
 minisign_bin="$(command -v minisign || true)"
-[ -z "$minisign_bin" ] && [ -x "$here/../tools/cross/bin/minisign.exe" ] && minisign_bin="$here/../tools/cross/bin/minisign.exe"
+for candidate in "$here/../tools/cross/bin/minisign.exe" "$here/../../inillucent/tools/cross/bin/minisign.exe"; do
+  [ -z "$minisign_bin" ] && [ -x "$candidate" ] && minisign_bin="$candidate"
+done
 if [ -n "$minisign_bin" ]; then
   "$minisign_bin" -Vm "$work/SHA256SUMS" -x "$work/SHA256SUMS.minisig" -p "$here/atrius-index.pub" >/dev/null \
     && ok "SHA256SUMS signature" || fail "SHA256SUMS signature does not verify"
