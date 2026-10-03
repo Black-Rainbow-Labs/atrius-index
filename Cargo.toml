@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/atrius-index", "crates/atrius-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Black-Rainbow-Labs/atrius-index"
+homepage = "https://blackrainbowlabs.com/lab/atrius-index"
+authors = ["Black Rainbow Labs <releases@blackrainbowlabs.com>"]
+
+[workspace.dependencies]
+atrius-index = { path = "crates/atrius-index", version = "0.1.0" }
+serde_json = "1.0"
+# The Inillucent engine through its driver, from crates.io. `embed` turns on the SQL `embed()` function
+# the passage table uses for vectors. ONNX Runtime is loaded when `embed()` first runs rather than linked,
+# so a machine with no model installed builds and runs the same binary.
+inillucent-driver = { version = "2.0.2", features = ["embed"] }
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
+blake3 = "1.5"
+sha2 = "0.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"

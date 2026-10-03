@@ -1,0 +1,24 @@
+# How rustfmt formats this workspace.
+#
+# `task-1922` found `cargo fmt --all -- --check` failing on 295 of the workspace's files, because
+# nothing had ever run it: CI's format step had never reached a job. Turning the check on means
+# accepting whatever rustfmt does to 213,000 lines that were written by hand, so which rustfmt is a
+# decision rather than a default.
+#
+# **`max_width = 100`** is the width the code was already written to. Measured before the first pass:
+# 12,819 lines are over 100 characters and 1,847 over 110, and nearly all of the first figure is
+# prose in doc comments, which rustfmt does not touch on stable.
+#
+# **`use_small_heuristics = "Max"`** is what keeps a call, a struct literal, a chain or an array on
+# one line for the whole hundred characters rather than for the fifty-ish the default sub-widths
+# allow. It was measured rather than preferred: the default heuristics rewrite the workspace as
+# 42,465 insertions against 11,999 deletions, and this setting makes the same pass 10,485 against
+# 6,331. The difference is entirely code that was on one line being broken over three, in a codebase
+# whose own style guide is about how it reads.
+#
+# What neither setting can save is a struct-shaped enum variant with a doc comment on it: rustfmt
+# cannot lay one out inline, and one such variant makes it write every variant in that enum
+# vertically. That is most of what is left in the pass, and it is stable rustfmt's own output rather
+# than something this file chose.
+max_width = 100
+use_small_heuristics = "Max"

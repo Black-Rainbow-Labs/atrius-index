@@ -1,0 +1,56 @@
+[package]
+name = "atrius-index"
+description = "A code search index: ripgrep's exact results from a trigram index, definitions and uses, fragments and outlines, and plain English passage search, kept fresh by a file watcher in one Inillucent file per checkout."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["search", "index", "ripgrep", "mcp", "code"]
+categories = ["command-line-utilities", "development-tools", "text-processing"]
+
+[dependencies]
+# The one file per checkout everything is kept in. `docs/architecture.md` describes the schema.
+inillucent-driver.workspace = true
+serde_json.workspace = true
+# The crates ripgrep is built from. Walking the tree with `ignore` and verifying candidates with
+# `grep-searcher` and `grep-regex` is what makes the exact family give the same `(path, line)` set as
+# `rg`: the same ignore rules, the same binary detection, the same encoding sniffing and the same regex
+# engine.
+ignore = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
+# The parser ripgrep's regex engine uses, to turn a pattern into a trigram query.
+regex-syntax = "0.8"
+regex = "1.11"
+# Content is held compressed in memory and in the index file; lz4 is fast enough to decompress
+# candidates inside a search's budget.
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "frame"] }
+# The content hash a file, a chunk and an embedding are keyed by, and the host's token.
+blake3.workspace = true
+# File events: ReadDirectoryChangesW on Windows, FSEvents on macOS, inotify on Linux.
+notify = "8"
+rayon = "1.10"
+# The Glob tool's globs, for `files`.
+globset = "0.4"
+memchr = "2.7"
+# A file with a UTF-16 byte order mark is searched by ripgrep as the text it decodes to, so its trigrams
+# are taken from that text.
+encoding_rs = "0.8"
+crossbeam-channel = "0.5"
+
+# The host takes its lock with `flock` on Unix.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+sha2.workspace = true
+
+# The host keeps its standard handles from leaking into the detached host it starts.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }

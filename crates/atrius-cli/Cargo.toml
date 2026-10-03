@@ -1,0 +1,36 @@
+[package]
+name = "atrius-cli"
+description = "The atrius command line and the atrius-mcp server for the Atrius code index: ripgrep's exact results from an index, definitions, uses, fragments, outlines and plain English search."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["search", "index", "ripgrep", "mcp", "code"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "atrius"
+path = "src/main.rs"
+
+[[bin]]
+name = "atrius-mcp"
+path = "src/bin/atrius-mcp.rs"
+
+[dependencies]
+atrius-index.workspace = true
+serde_json.workspace = true
+# `atrius doctor` checks that the platform's file watcher delivers an event.
+notify = "8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,6 @@
+/target
+/dist
+/_agent_output
+/tests/corpora/cache
+*.rdb
+*.rdb-wal.*

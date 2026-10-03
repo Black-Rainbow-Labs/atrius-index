@@ -1,0 +1,12 @@
+# The toolchain Unluminous is built and checked with, so `cargo fmt --check` and `cargo clippy` mean
+# the same thing on every machine that builds it.
+#
+# `task-1922` found the workspace failing `cargo fmt --all -- --check` on 295 files while the format
+# step it had written had never once run to completion. A formatting gate is only a gate if everything
+# running it agrees on which rustfmt that is: rustfmt's output changes between releases, so "whatever
+# is installed that day" is a check that passes on one machine and fails on another for a reason
+# nobody can see. The version is written down once, here, and rustup installs it from this file on any
+# machine that runs cargo in this folder.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
