@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	The programs load ONNX Runtime with dlopen for embed() and rerank(). ONNX
+	Runtime is signed by Microsoft. Under the hardened runtime, which notarisation
+	requires, a program refuses a library signed by another team unless it has
+	this entitlement. 2.0.3 shipped without it, and embed() failed in every one of
+	its programs on macOS. release-macos.ps1 signs every program with this file
+	and Assert-Signature reads the entitlement back.
+	-->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

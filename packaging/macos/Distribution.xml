@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The installer's own description. `hostArchitectures` names both because the payload is universal.
+  The pkg-ref's `#` names the component package inside this archive; without it Apple's notary
+  cannot extract the contents.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>Atrius</title>
+    <organization>com.blackrainbowlabs</organization>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64" />
+
+    <welcome file="welcome.txt" mime-type="text/plain" />
+    <license file="LICENSE" mime-type="text/plain" />
+    <conclusion file="conclusion.txt" mime-type="text/plain" />
+
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="13.0" />
+        </allowed-os-versions>
+    </volume-check>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.blackrainbowlabs.atrius-index" />
+        </line>
+    </choices-outline>
+
+    <choice id="default" />
+    <choice id="com.blackrainbowlabs.atrius-index" visible="false">
+        <pkg-ref id="com.blackrainbowlabs.atrius-index" />
+    </choice>
+
+    <pkg-ref id="com.blackrainbowlabs.atrius-index" version="@VERSION@" onConclusion="none">#atrius-index-component-@VERSION@.pkg</pkg-ref>
+</installer-gui-script>

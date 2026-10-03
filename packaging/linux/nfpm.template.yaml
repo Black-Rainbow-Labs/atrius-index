@@ -1,0 +1,43 @@
+# The .deb and .rpm metadata, filled in by packaging/linux/package-linux.ps1.
+#
+# @VERSION@, @ARCH@ and @STAGE@ are replaced before nfpm reads this. Every entry carries an explicit
+# mode, because NTFS has no execute bit and a package built from files staged on Windows would
+# otherwise install its programs without one.
+
+name: atrius-index
+arch: @ARCH@
+platform: linux
+version: @VERSION@
+section: devel
+priority: optional
+maintainer: Black Rainbow Labs <releases@blackrainbowlabs.com>
+description: |
+  A code index for AI agents and for people.
+  Answers the questions an agent asks ripgrep, with exactly ripgrep's lines, from
+  an index kept current as files change, and finds definitions, fragments and
+  outlines in 24 languages. Ships atrius and the MCP server atrius-mcp.
+vendor: Black Rainbow Labs
+homepage: https://blackrainbowlabs.com/lab
+license: MIT OR Apache-2.0
+
+contents:
+  - src: @STAGE@/bin/atrius
+    dst: /usr/bin/atrius
+    file_info:
+      mode: 0755
+  - src: @STAGE@/bin/atrius-mcp
+    dst: /usr/bin/atrius-mcp
+    file_info:
+      mode: 0755
+  - src: @STAGE@/README.md
+    dst: /usr/share/doc/atrius-index/README.md
+    file_info:
+      mode: 0644
+  - src: @STAGE@/LICENSE-MIT
+    dst: /usr/share/doc/atrius-index/LICENSE-MIT
+    file_info:
+      mode: 0644
+  - src: @STAGE@/LICENSE-APACHE
+    dst: /usr/share/doc/atrius-index/LICENSE-APACHE
+    file_info:
+      mode: 0644

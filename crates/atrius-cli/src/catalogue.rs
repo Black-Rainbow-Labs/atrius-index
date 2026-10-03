@@ -106,7 +106,7 @@ pub const JSON: Flag = switch("json", "Print the whole reply as JSON instead of 
 
 /// The flag that asks for the fields behind the text.
 const STRUCTURED: Flag =
-    switch("structured", "Also answer with the fields behind the text, for a program rather than an agent.");
+    switch("structured", "Also answer with the fields behind the text, for a program to read.");
 
 /// Every command.
 pub const COMMANDS: &[Command] = &[

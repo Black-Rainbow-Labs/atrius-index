@@ -4,3 +4,6 @@
 /tests/corpora/cache
 *.rdb
 *.rdb-wal.*
+
+/tools/cross/bin
+/tools/cross/cache

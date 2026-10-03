@@ -1,0 +1,22 @@
+Atrius is installed.
+
+Inside any git checkout:
+
+  atrius find TODO
+  atrius def main
+  atrius doctor
+
+To give an AI agent the same queries:
+
+  claude mcp add atrius -- /usr/local/bin/atrius-mcp
+
+To keep a checkout indexed at all times:
+
+  atrius watch add ~/code/my-project
+  atrius service install
+
+To remove it:
+
+  atrius service uninstall
+  sudo rm -f /usr/local/bin/atrius /usr/local/bin/atrius-mcp
+  sudo pkgutil --forget com.blackrainbowlabs.atrius-index

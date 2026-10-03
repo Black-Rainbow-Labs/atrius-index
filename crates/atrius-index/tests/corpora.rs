@@ -294,13 +294,16 @@ fn parity(rg: &Path, name: &str, root: &Path, language: &str, count: usize) -> V
     let (mut equal, mut both_refused, mut index_ms, mut rg_ms, mut hits) = (0, 0, 0f64, 0f64, 0usize);
     let mut differences: Vec<Value> = Vec::new();
     let mut by_kind: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let (mut index_times, mut rg_times): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
     for q in &qs {
         let t = Instant::now();
         let ours = index_set(&index, root, q);
         index_ms += t.elapsed().as_secs_f64() * 1000.0;
+        index_times.push(t.elapsed().as_secs_f64() * 1000.0);
         let t = Instant::now();
         let theirs = rg_set(rg, root, q);
         rg_ms += t.elapsed().as_secs_f64() * 1000.0;
+        rg_times.push(t.elapsed().as_secs_f64() * 1000.0);
         let entry = by_kind.entry(q.kind).or_insert((0, 0));
         entry.0 += 1;
         match (ours, theirs) {
@@ -337,9 +340,22 @@ fn parity(rg: &Path, name: &str, root: &Path, language: &str, count: usize) -> V
         "lines": hits,
         "indexMs": (index_ms * 10.0).round() / 10.0,
         "rgMs": (rg_ms * 10.0).round() / 10.0,
+        "indexMedianMs": median(&mut index_times),
+        "rgMedianMs": median(&mut rg_times),
         "byKind": by_kind.iter().map(|(k, (n, e))| (k.to_string(), json!({ "queries": n, "equal": e }))).collect::<Map<String, Value>>(),
         "differences": differences,
     })
+}
+
+/// The median of some timings, to two places.
+///
+/// @param times - the timings
+fn median(times: &mut [f64]) -> f64 {
+    if times.is_empty() {
+        return 0.0;
+    }
+    times.sort_by(|a, b| a.total_cmp(b));
+    (times[times.len() / 2] * 100.0).round() / 100.0
 }
 
 /// Whether `def` finds each listed definition in its first three answers, and whether `outline` and
@@ -384,7 +400,10 @@ fn definitions(root: &Path, definitions: &[Value]) -> Value {
     json!({ "checked": definitions.len(), "found": found, "missed": missed })
 }
 
+/// Ignored by default: it reads gigabytes of source and is meant for a release build. Run it with
+/// `cargo test --release -p atrius-index --test corpora -- --ignored --nocapture`.
 #[test]
+#[ignore = "reads the fetched corpora; run with --ignored in a release build"]
 fn every_fetched_corpus_matches_ripgrep_and_finds_its_definitions() {
     let Some(rg) = ripgrep() else {
         eprintln!("no ripgrep to compare with: set ATRIUS_RG to one");

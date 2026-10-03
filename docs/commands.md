@@ -56,7 +56,7 @@ atrius find <query...> [--mode <auto|literal|regex|symbol|semantic>] [--path <pa
 | `--type <name>` | Only files of this ripgrep type, such as `rust`, `ts` or `py`. |
 | `-i`, `--ignore-case` | Match regardless of case. |
 | `--budget <tokens>` | How much text to answer with, in tokens. 1500 by default; 0 for every line. |
-| `--structured` | Also answer with the fields behind the text, for a program rather than an agent. |
+| `--structured` | Also answer with the fields behind the text, for a program to read. |
 | `--root <folder>` | The checkout. The git checkout at or above the working folder by default. |
 | `--json` | Print the whole reply as JSON instead of its text. |
 
@@ -85,7 +85,7 @@ atrius def <name> [--limit <number>] [--path <path>] [--structured] [--root <fol
 |---|---|
 | `--limit <number>` | How many definitions to list. 10 by default. |
 | `--path <path>` | Only definitions under this folder. |
-| `--structured` | Also answer with the fields behind the text, for a program rather than an agent. |
+| `--structured` | Also answer with the fields behind the text, for a program to read. |
 | `--root <folder>` | The checkout. The git checkout at or above the working folder by default. |
 | `--json` | Print the whole reply as JSON instead of its text. |
 
@@ -113,7 +113,7 @@ atrius refs <name> [--path <path>] [--glob <glob>] [--budget <tokens>] [--struct
 | `--path <path>` | Only uses under this folder or in this file. |
 | `--glob <glob>` | Only files matching these globs. |
 | `--budget <tokens>` | How much text to answer with, in tokens. 1500 by default; 0 for every use. |
-| `--structured` | Also answer with the fields behind the text, for a program rather than an agent. |
+| `--structured` | Also answer with the fields behind the text, for a program to read. |
 | `--root <folder>` | The checkout. The git checkout at or above the working folder by default. |
 | `--json` | Print the whole reply as JSON instead of its text. |
 
@@ -140,7 +140,7 @@ atrius fragment <target> [--line <number>] [--context <lines>] [--structured] [-
 |---|---|
 | `--line <number>` | The line, when the target is a file alone. |
 | `--context <lines>` | Extra lines before and after it. None by default. |
-| `--structured` | Also answer with the fields behind the text, for a program rather than an agent. |
+| `--structured` | Also answer with the fields behind the text, for a program to read. |
 | `--root <folder>` | The checkout. The git checkout at or above the working folder by default. |
 | `--json` | Print the whole reply as JSON instead of its text. |
 
@@ -165,7 +165,7 @@ atrius outline <path> [--structured] [--root <folder>] [--json]
 
 | Flag | What it does |
 |---|---|
-| `--structured` | Also answer with the fields behind the text, for a program rather than an agent. |
+| `--structured` | Also answer with the fields behind the text, for a program to read. |
 | `--root <folder>` | The checkout. The git checkout at or above the working folder by default. |
 | `--json` | Print the whole reply as JSON instead of its text. |
 
@@ -192,7 +192,7 @@ atrius files <query...> [--limit <number>] [--path <folder>] [--structured] [--r
 |---|---|
 | `--limit <number>` | How many to list. 20 by default. |
 | `--path <folder>` | Only files under this folder; a glob is matched relative to it. |
-| `--structured` | Also answer with the fields behind the text, for a program rather than an agent. |
+| `--structured` | Also answer with the fields behind the text, for a program to read. |
 | `--root <folder>` | The checkout. The git checkout at or above the working folder by default. |
 | `--json` | Print the whole reply as JSON instead of its text. |
 

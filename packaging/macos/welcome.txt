@@ -1,0 +1,15 @@
+Atrius
+
+A code index for AI agents and for people. It answers the questions an agent
+asks ripgrep, with exactly ripgrep's lines, from an index it keeps current as
+files change. It also finds where a name is defined, shows just the function
+around a line, and answers questions in plain English.
+
+This installs two programs into /usr/local/bin:
+
+  atrius        the command line: find, def, refs, fragment, outline, files,
+                status, and the background service
+  atrius-mcp    the same queries for an AI agent, as one MCP tool
+
+Nothing runs in the background unless you ask for it with
+`atrius service install`.
