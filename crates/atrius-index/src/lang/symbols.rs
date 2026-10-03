@@ -327,8 +327,13 @@ impl FileSymbols {
                                 return;
                             }
                         }
+                        // A C function written `name (args)` is a word and not a call to the tokeniser,
+                        // because of the space, so under `language.definition_tail` a plain word or a
+                        // capitalised one is tried too.
+                        let candidate = token == Token::Function
+                            || (grammar.definition_tail && matches!(token, Token::Text | Token::Type));
                         if grammar.brace_definitions
-                            && token == Token::Function
+                            && candidate
                             && is_brace_definition(text, &range, grammar)
                         {
                             read.definitions.push(Definition {
@@ -545,6 +550,11 @@ fn is_brace_definition(text: &str, name: &Range<usize>, grammar: &Grammar) -> bo
     }
     let bytes = text.as_bytes();
     let mut at = name.end;
+    if grammar.definition_tail {
+        while matches!(bytes.get(at), Some(b' ') | Some(b'\t')) {
+            at += 1;
+        }
+    }
     if bytes.get(at) != Some(&b'(') {
         return false;
     }

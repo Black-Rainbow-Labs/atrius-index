@@ -1,0 +1,115 @@
+{
+  "about": "Real open source repositories the corpus tests search, each pinned to a release tag. `node tests/fetch-corpora.mjs` clones each one at its tag into ATRIUS_CORPORA. `definitions` lists names a person checked by reading the code: `def <name>` must return a definition in a file whose path ends with `file` among its first three answers. Sizes: small is under 500 files, medium under 5,000, large under 30,000.",
+  "corpora": [
+    { "name": "cobra", "repo": "spf13/cobra", "tag": "v1.9.1", "language": "Go", "size": "small",
+      "definitions": [
+        { "name": "Find", "file": "command.go" },
+        { "name": "NoArgs", "file": "args.go" },
+        { "name": "MarkFlagRequired", "file": "shell_completions.go" }
+      ] },
+    { "name": "lua", "repo": "lua/lua", "tag": "v5.4.7", "language": "C", "size": "small",
+      "definitions": [
+        { "name": "luaD_call", "file": "ldo.c" },
+        { "name": "luaH_get", "file": "ltable.c" },
+        { "name": "luaV_execute", "file": "lvm.c" }
+      ] },
+    { "name": "requests", "repo": "psf/requests", "tag": "v2.32.3", "language": "Python", "size": "small",
+      "definitions": [
+        { "name": "merge_setting", "file": "requests/sessions.py" },
+        { "name": "super_len", "file": "requests/utils.py" },
+        { "name": "Session", "file": "requests/sessions.py" },
+        { "name": "HTTPAdapter", "file": "requests/adapters.py" }
+      ] },
+    { "name": "ripgrep", "repo": "BurntSushi/ripgrep", "tag": "14.1.1", "language": "Rust", "size": "small",
+      "definitions": [
+        { "name": "search_parallel", "file": "crates/core/main.rs" },
+        { "name": "HiArgs", "file": "crates/core/flags/hiargs.rs" },
+        { "name": "Searcher", "file": "searcher/mod.rs" },
+        { "name": "SearchWorker", "file": "crates/core/search.rs" }
+      ] },
+    { "name": "express", "repo": "expressjs/express", "tag": "v5.1.0", "language": "JavaScript", "size": "small",
+      "definitions": [
+        { "name": "createApplication", "file": "lib/express.js" },
+        { "name": "View", "file": "lib/view.js" },
+        { "name": "sendFile", "file": "lib/response.js" }
+      ] },
+    { "name": "sinatra", "repo": "sinatra/sinatra", "tag": "v4.1.1", "language": "Ruby", "size": "small",
+      "definitions": [
+        { "name": "erb", "file": "lib/sinatra/base.rb" },
+        { "name": "compile_template", "file": "lib/sinatra/base.rb" }
+      ] },
+    { "name": "gson", "repo": "google/gson", "tag": "gson-parent-2.11.0", "language": "Java", "size": "small",
+      "definitions": [
+        { "name": "GsonBuilder", "file": "com/google/gson/GsonBuilder.java" },
+        { "name": "JsonParser", "file": "com/google/gson/JsonParser.java" },
+        { "name": "TypeAdapter", "file": "com/google/gson/TypeAdapter.java" }
+      ] },
+    { "name": "okhttp", "repo": "square/okhttp", "tag": "parent-4.12.0", "language": "Kotlin", "size": "medium",
+      "definitions": [
+        { "name": "OkHttpClient", "file": "okhttp3/OkHttpClient.kt" },
+        { "name": "RealCall", "file": "connection/RealCall.kt" },
+        { "name": "Dispatcher", "file": "Dispatcher.kt" }
+      ] },
+    { "name": "alamofire", "repo": "Alamofire/Alamofire", "tag": "5.10.2", "language": "Swift", "size": "medium",
+      "definitions": [
+        { "name": "Session", "file": "Source/Core/Session.swift" },
+        { "name": "DataRequest", "file": "Source/Core/DataRequest.swift" },
+        { "name": "AFError", "file": "Source/Core/AFError.swift" }
+      ] },
+    { "name": "nlohmann-json", "repo": "nlohmann/json", "tag": "v3.11.3", "language": "C++", "size": "medium",
+      "definitions": [
+        { "name": "basic_json", "file": "json.hpp" },
+        { "name": "parser", "file": "parser.hpp" },
+        { "name": "lexer", "file": "lexer.hpp" }
+      ] },
+    { "name": "newtonsoft-json", "repo": "JamesNK/Newtonsoft.Json", "tag": "13.0.3", "language": "C#", "size": "medium",
+      "definitions": [
+        { "name": "SerializeObject", "file": "Newtonsoft.Json/JsonConvert.cs" },
+        { "name": "JsonSerializer", "file": "Newtonsoft.Json/JsonSerializer.cs" },
+        { "name": "JsonTextReader", "file": "Newtonsoft.Json/JsonTextReader.cs" }
+      ] },
+    { "name": "redis", "repo": "redis/redis", "tag": "7.4.2", "language": "C", "size": "medium",
+      "definitions": [
+        { "name": "lookupKeyRead", "file": "src/db.c" },
+        { "name": "createClient", "file": "src/networking.c" },
+        { "name": "serverCron", "file": "src/server.c" }
+      ] },
+    { "name": "vite", "repo": "vitejs/vite", "tag": "v6.0.0", "language": "TypeScript", "size": "medium",
+      "definitions": [
+        { "name": "createServer", "file": "src/node/server/index.ts" },
+        { "name": "resolveConfig", "file": "src/node/config.ts" },
+        { "name": "ssrLoadModule", "file": "ssr/ssrModuleLoader.ts" },
+        { "name": "ModuleGraph", "file": "server/mixedModuleGraph.ts" }
+      ] },
+    { "name": "laravel", "repo": "laravel/framework", "tag": "v11.0.0", "language": "PHP", "size": "medium",
+      "definitions": [
+        { "name": "Collection", "file": "Collection.php" },
+        { "name": "retry", "file": ".php" }
+      ] },
+    { "name": "django", "repo": "django/django", "tag": "5.1", "language": "Python", "size": "large",
+      "definitions": [
+        { "name": "get_object_or_404", "file": "django/shortcuts.py" },
+        { "name": "QuerySet", "file": "django/db/models/query.py" },
+        { "name": "reverse", "file": ".py" }
+      ] },
+    { "name": "go", "repo": "golang/go", "tag": "go1.23.0", "language": "Go", "size": "large",
+      "definitions": [
+        { "name": "Sprintf", "file": "src/fmt/print.go" },
+        { "name": "ListenAndServe", "file": "src/net/http/server.go" },
+        { "name": "NewRequest", "file": ".go" }
+      ] },
+    { "name": "zig", "repo": "ziglang/zig", "tag": "0.13.0", "language": "Zig", "size": "large",
+      "definitions": [
+        { "name": "ArrayList", "file": "lib/std/array_list.zig" },
+        { "name": "parseInt", "file": ".zig" }
+      ] },
+    { "name": "scala3", "repo": "scala/scala3", "tag": "3.5.0", "language": "Scala", "size": "large",
+      "definitions": [
+        { "name": "TreeChecker", "file": "transform/TreeChecker.scala" },
+        { "name": "Inliner", "file": "inlines/Inliner.scala" },
+        { "name": "Typer", "file": ".scala" }
+      ] },
+    { "name": "linux", "repo": "torvalds/linux", "tag": "v6.16", "language": "C", "size": "extra large",
+      "definitions": [] }
+  ]
+}

@@ -163,6 +163,24 @@ impl Index {
         false
     }
 
+    /// Blocks until the symbol table is built as well as the exact index, or the timeout passes. A
+    /// question about definitions asked the moment a host starts waits here rather than being refused.
+    ///
+    /// @param timeout - how long to wait
+    pub fn wait_for_symbols(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let built = self.status().ready && self.symbols.read().map(|s| s.is_some()).unwrap_or(false);
+            if built {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Runs the gate, so the index agrees with the files as they are now, and hands what changed to the
     /// store thread. Returns None while the index is not loaded yet.
     pub fn gate(&self) -> Option<GateReport> {

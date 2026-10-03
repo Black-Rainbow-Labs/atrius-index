@@ -35,6 +35,18 @@ pub struct SymbolTable {
 /// @param path - the path
 pub fn is_secondary(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
+    // A folder of examples, demonstrations or documentation at any depth. Measured on vite 6.0.0:
+    // `createServer` is defined once in `packages/vite/src/node/server/index.ts` and again in eleven
+    // `playground/*/server.js` files, which ranked ahead of it.
+    const FOLDERS: &[&str] = &[
+        "example", "examples", "playground", "playgrounds", "demo", "demos", "sample", "samples",
+        "docs", "doc", "bench", "benches", "benchmark", "benchmarks", "third_party", "thirdparty",
+        "node_modules", "spec", "specs", "__tests__", "testdata", "test-data",
+    ];
+    let mut folders = lower.split('/').rev().skip(1);
+    if folders.any(|f| FOLDERS.contains(&f)) {
+        return true;
+    }
     lower.contains("/test")
         || lower.starts_with("test")
         || lower.contains("tests/")

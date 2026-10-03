@@ -91,6 +91,13 @@ fn looks_like_regex(query: &str) -> bool {
 /// @param verb - the verb, such as `find`
 /// @param args - the request's arguments
 pub fn answer(index: &Index, verb: &str, args: &Map<String, Value>) -> Result<Value, Refusal> {
+    // Every verb but `find` and `status` needs the built index. `find` is answered by scanning the files
+    // while it builds; the others wait for it, for `ATRIUS_READY_WAIT_SECONDS` (30 by default), so the
+    // first question an agent asks after starting a server is answered rather than refused.
+    if !matches!(verb, "find" | "status") {
+        let seconds = std::env::var("ATRIUS_READY_WAIT_SECONDS").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(30);
+        index.wait_for_symbols(std::time::Duration::from_secs(seconds));
+    }
     let (resolved, note) = resolve_path(index, args);
     let args = &resolved;
     let mut value = match verb {
@@ -701,6 +708,9 @@ fn find_symbol(index: &Index, asked: &FindRequest) -> Result<Option<Value>, Refu
         .filter(|d| {
             d.definition.name == asked.query || d.definition.name.eq_ignore_ascii_case(&asked.query)
         })
+        // A `--path`, `--glob` or `--type` narrows the definitions as well as the uses: asked for
+        // `retry_write` in `*.py`, a Rust definition is not an answer.
+        .filter(|d| asked.scope.contains(&d.path))
         .collect();
     if defs.is_empty() {
         return Ok(None);
