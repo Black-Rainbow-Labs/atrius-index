@@ -146,7 +146,7 @@ impl Index {
 
     /// A copy of the status.
     pub fn status(&self) -> Status {
-        self.status.lock().expect("status").clone()
+        lock(&self.status).clone()
     }
 
     /// Blocks until the index is loaded or built, or the timeout passes. For tests and `search build`.
@@ -210,7 +210,7 @@ impl Index {
                 self.compact_in_background();
             }
         }
-        let mut status = self.status.lock().expect("status");
+        let mut status = lock(&self.status);
         status.gates += 1;
         status.reindexed += report.changed.len() as u64;
         Some(report)
@@ -282,6 +282,17 @@ impl Index {
         if self.gate().is_none() {
             return Err("the index is still being built".into());
         }
+        // **Answered at once while the passage table is being built**, rather than queued behind the build
+        // on the store thread and given up on after thirty seconds, which on a first build was every plain
+        // English question an agent asked. The caller answers from the question's words meanwhile.
+        // A store that could not be opened is the exception: the search goes to the store thread, which
+        // tries to open it again for every job and answers with the reason when it still cannot.
+        {
+            let st = lock(&self.status);
+            if !st.passages_ready && st.store_error.is_none() {
+                return Err("the passage table is still being built".to_owned());
+            }
+        }
         let (tx, rx) = channel();
         self.store
             .send(StoreJob::Search {
@@ -342,7 +353,7 @@ fn store_thread(
     if origin == "built" {
         if let Ok(s) = &store {
             if let Err(e) = s.save_exact(&index, root) {
-                status.lock().expect("status").store_error = Some(e);
+                lock(status).store_error = Some(e);
             }
         }
     }
@@ -350,7 +361,7 @@ fn store_thread(
     *exact.write().expect("exact") = Some(index);
     *symbol_table.write().expect("symbols") = Some(table);
     {
-        let mut st = status.lock().expect("status");
+        let mut st = lock(status);
         st.ready = true;
         st.origin = origin.into();
         st.load_ms = started.elapsed().as_millis();
@@ -358,18 +369,54 @@ fn store_thread(
             st.store_error = Some(e.clone());
         }
     }
-    let Ok(store) = store else { return };
-    build_passages(&store, exact, status, origin == "built");
+    // **A store that cannot be opened is tried again rather than given up on** (Unluminous `task-2200`).
+    // This thread used to return here, and from then on every plain English search answered "the index's
+    // store has stopped" for the life of the process while exact searches went on working. Opening fails
+    // when the file is still held by a process that is on its way out, so it is tried again a few times
+    // now and then once for every job that arrives, and a search that arrives meanwhile is told why.
+    let mut first_job = None;
+    let (store, rebuilt) = match store {
+        Ok(store) => (store, origin == "built"),
+        Err(error) => match open_the_store_again(root, status, error, &jobs) {
+            Some((store, job)) => {
+                first_job = job;
+                // The exact index this process holds was never written to this file, so it is written now
+                // and the passages are built from it.
+                if let Some(index) = exact.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    if let Err(e) = store.save_exact(index, root) {
+                        lock(status).store_error = Some(e);
+                    }
+                }
+                (store, true)
+            }
+            None => return,
+        },
+    };
+    build_passages(&store, exact, status, rebuilt);
     let mut embedder = Embedder::open(&store, status);
     loop {
+        if let Some(job) = first_job.take() {
+            run_a_job(&store, root, status, embedder.as_mut(), job);
+            continue;
+        }
         // Embedding is done a small batch at a time, only when no other job is waiting, so a query
         // never waits behind more than one batch.
         let job = match embedder.as_ref().filter(|e| e.pending) {
             Some(_) => match jobs.try_recv() {
                 Ok(job) => job,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if let Some(e) = embedder.as_mut() {
-                        e.step(&store, status);
+                    let panicked = embedder.as_mut().and_then(|e| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            e.step(&store, status)
+                        }))
+                        .err()
+                    });
+                    if let Some(panic) = panicked {
+                        // An embedder that panics once will panic again on the same chunk, so it is
+                        // stopped; the words still answer every search.
+                        lock(status).not_embedding =
+                            Some(format!("the embedder panicked: {}", panic_message(&panic)));
+                        embedder = None;
                     }
                     continue;
                 }
@@ -380,33 +427,125 @@ fn store_thread(
                 Err(_) => return,
             },
         };
-        if let (Some(e), StoreJob::Changes { .. }) = (embedder.as_mut(), &job) {
-            e.pending = true;
-        }
-        let result = match job {
-            StoreJob::Changes { changed, removed, removed_paths, next_id } => {
-                let records: Vec<&FileRecord> = changed.iter().map(|c| &c.1).collect();
-                store
-                    .save_changes(&changed, &removed, next_id)
-                    .and_then(|()| passages::update(&store.session(), &removed_paths, &records))
+        run_a_job(&store, root, status, embedder.as_mut(), job);
+    }
+}
+
+/// The status, even when a thread panicked while it held it.
+///
+/// @param status - the status
+fn lock(status: &Mutex<Status>) -> std::sync::MutexGuard<'_, Status> {
+    status.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How many times the store is tried again straight away, and how long apart, before it is left to the
+/// next job to try.
+const STORE_RETRIES: u32 = 5;
+const STORE_RETRY_GAP: Duration = Duration::from_millis(400);
+
+/// Opens the store again after the first open failed: a few times straight away, then once for every job
+/// that arrives. A search that arrives while it still cannot be opened is answered with the reason.
+/// Answers the store and the job that found it open, or `None` when the index was dropped first.
+///
+/// @param root - the root
+/// @param status - the status to update
+/// @param error - why the first open failed
+/// @param jobs - the jobs
+fn open_the_store_again(
+    root: &Path,
+    status: &Mutex<Status>,
+    mut error: String,
+    jobs: &std::sync::mpsc::Receiver<StoreJob>,
+) -> Option<(Store, Option<StoreJob>)> {
+    let folder = store::index_folder(root);
+    for _ in 0..STORE_RETRIES {
+        std::thread::sleep(STORE_RETRY_GAP);
+        match Store::open(&folder) {
+            Ok(store) => {
+                lock(status).store_error = None;
+                return Some((store, None));
             }
-            StoreJob::Full { index } => store.save_exact(&index, root),
-            StoreJob::Search { question, k, kind, reply } => {
-                let vectors = status.lock().expect("status").vectors > 0;
-                let _ = reply.send(passages::search(
-                    &store.session(),
-                    &question,
-                    k,
-                    kind.as_deref(),
-                    vectors,
-                ));
-                Ok(())
-            }
-        };
-        if let Err(e) = result {
-            status.lock().expect("status").store_error = Some(e);
+            Err(e) => error = e,
         }
     }
+    loop {
+        lock(status).store_error = Some(error.clone());
+        let job = jobs.recv().ok()?;
+        match Store::open(&folder) {
+            Ok(store) => {
+                lock(status).store_error = None;
+                return Some((store, Some(job)));
+            }
+            Err(e) => {
+                error = e;
+                if let StoreJob::Search { reply, .. } = job {
+                    let _ = reply.send(Err(format!("the index file could not be opened: {error}")));
+                }
+            }
+        }
+    }
+}
+
+/// Runs one job on the store thread.
+///
+/// **A panic in one job is caught and written down rather than ending the thread** (Unluminous
+/// `task-2200`). The thread owns the passage table, so ending it turned every later plain English search
+/// into "the index's store has stopped". A search whose job panicked is answered by its reply being
+/// dropped, which its caller reports, and the next job runs as usual.
+///
+/// @param store - the store
+/// @param root - the root
+/// @param status - the status to update
+/// @param embedder - the embedder, if there is one
+/// @param job - the job
+fn run_a_job(
+    store: &Store,
+    root: &Path,
+    status: &Mutex<Status>,
+    embedder: Option<&mut Embedder>,
+    job: StoreJob,
+) {
+    if let (Some(e), StoreJob::Changes { .. }) = (embedder, &job) {
+        e.pending = true;
+    }
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
+        StoreJob::Changes { changed, removed, removed_paths, next_id } => {
+            let records: Vec<&FileRecord> = changed.iter().map(|c| &c.1).collect();
+            store
+                .save_changes(&changed, &removed, next_id)
+                .and_then(|()| passages::update(&store.session(), &removed_paths, &records))
+        }
+        StoreJob::Full { index } => store.save_exact(&index, root),
+        StoreJob::Search { question, k, kind, reply } => {
+            let vectors = lock(status).vectors > 0;
+            let _ = reply.send(passages::search(
+                &store.session(),
+                &question,
+                k,
+                kind.as_deref(),
+                vectors,
+            ));
+            Ok(())
+        }
+    }));
+    let result = match ran {
+        Ok(result) => result,
+        Err(panic) => Err(format!("a store job panicked: {}", panic_message(&panic))),
+    };
+    if let Err(e) = result {
+        lock(status).store_error = Some(e);
+    }
+}
+
+/// The words a panic was raised with, when it was raised with words.
+///
+/// @param panic - what `catch_unwind` caught
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_owned())
 }
 
 /// The background embedder: whether `embed()` works here, the shared cache of vectors by chunk hash,
@@ -446,7 +585,7 @@ impl Embedder {
         let able = passages::can_embed(&session);
         let (vectors, _) = passages::vector_counts(&session);
         {
-            let mut st = status.lock().expect("status");
+            let mut st = lock(status);
             st.can_embed = able;
             st.vectors = vectors;
         }
@@ -454,7 +593,7 @@ impl Embedder {
             return None;
         }
         if let Some(reason) = why_not_embed(passages::vector_counts(&session).1) {
-            status.lock().expect("status").not_embedding = Some(reason);
+            lock(status).not_embedding = Some(reason);
             return None;
         }
         let folder = store::cache_folder().join("atrius-index").join("embeddings");
@@ -483,10 +622,10 @@ impl Embedder {
             Ok(_) => {}
             Err(e) => {
                 self.pending = false;
-                status.lock().expect("status").store_error = Some(format!("embedding: {e}"));
+                lock(status).store_error = Some(format!("embedding: {e}"));
             }
         }
-        status.lock().expect("status").vectors = passages::vector_counts(&session).0;
+        lock(status).vectors = passages::vector_counts(&session).0;
     }
 }
 
@@ -533,7 +672,7 @@ fn build_passages(
             .unwrap_or_default();
         passages::rebuild(&session, &records)
     };
-    let mut st = status.lock().expect("status");
+    let mut st = lock(status);
     match built {
         Ok(count) => {
             st.passages = count;

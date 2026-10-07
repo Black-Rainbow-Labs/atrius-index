@@ -271,8 +271,20 @@ fn find(index: &Index, args: &Map<String, Value>) -> Result<Value, Refusal> {
         scope: &asked.scope,
     };
     let started = std::time::Instant::now();
-    let (found, engine) =
-        index.exact(&request).map_err(|e| usage(format!("The pattern was refused: {e}")))?;
+    // **In `auto` mode a query that only looks like a regex is searched as the text it is** (Unluminous
+    // `task-2200`). `auto` reads braces, brackets and parentheses as a regex, so a line of code such as
+    // `fn main() { println!("hi"); }` was refused as a malformed pattern and cost the agent a turn. A query
+    // somebody asked for as a regex is still refused when it does not parse.
+    let literal;
+    let (found, engine) = match index.exact(&request) {
+        Ok(found) => found,
+        Err(_) if asked.auto && asked.regex => {
+            literal = regex::escape(&asked.query);
+            let request = ExactRequest { pattern: &literal, ..request };
+            index.exact(&request).map_err(|e| usage(format!("The pattern was refused: {e}")))?
+        }
+        Err(e) => return Err(usage(format!("The pattern was refused: {e}"))),
+    };
     // Words that are not a regex and are not in the code literally are a question about meaning.
     if asked.auto
         && !asked.regex
@@ -305,6 +317,70 @@ fn find(index: &Index, args: &Map<String, Value>) -> Result<Value, Refusal> {
         }
     }
     Ok(value)
+}
+
+/// The most files an answer from a question's words lists.
+const WORD_FILES: usize = 8;
+
+/// A plain English question answered from its words, for when the passage table cannot answer it.
+///
+/// The files that hold the most of the question's words come first, each with the lines that hold them.
+/// It says why the passages were not used, so the answer is not mistaken for a ranked one.
+///
+/// @param index - the index
+/// @param asked - the question
+/// @param why - why the passage table did not answer
+fn by_the_words(index: &Index, asked: &FindRequest, why: &str) -> Result<Value, Refusal> {
+    let words = crate::words::query_words(&asked.query);
+    if words.is_empty() {
+        return Err(Refusal { code: "not-applicable", message: why.to_owned() });
+    }
+    let pattern = format!(
+        r"\b(?:{})\b",
+        words.iter().map(|w| regex::escape(w)).collect::<Vec<_>>().join("|")
+    );
+    let request =
+        ExactRequest { pattern: &pattern, case_insensitive: true, scope: &asked.scope };
+    let (found, _) = index.exact(&request).map_err(|e| Refusal { code: "failed", message: e })?;
+    // How many of the question's words each file holds, then how many lines hold any of them.
+    let mut files: Vec<(String, usize, Vec<&crate::exact::Hit>)> = Vec::new();
+    for hit in &found.hits {
+        match files.iter_mut().find(|f| f.0 == hit.path) {
+            Some(file) => file.2.push(hit),
+            None => files.push((hit.path.clone(), 0, vec![hit])),
+        }
+    }
+    for file in &mut files {
+        let text: String = file.2.iter().map(|h| h.text.to_lowercase()).collect::<Vec<_>>().join("\n");
+        file.1 = words.iter().filter(|w| text.contains(w.as_str())).count();
+    }
+    files.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.len().cmp(&a.2.len())).then(a.0.cmp(&b.0)));
+    files.truncate(WORD_FILES);
+    let budget = if asked.budget == 0 { usize::MAX } else { asked.budget };
+    let mut text = format!(
+        "answered from the question's words, because the passage search could not answer: {why}\n"
+    );
+    for (path, held, hits) in &files {
+        let mut block = format!("{path} ({held} of {} words)\n", words.len());
+        for hit in hits.iter().take(3) {
+            block.push_str(&format!("  {}: {}\n", hit.line, shape::trim_line(&hit.text, "")));
+        }
+        if shape::tokens(&text) + shape::tokens(&block) > budget {
+            break;
+        }
+        text.push_str(&block);
+    }
+    if files.is_empty() {
+        text.push_str("no line in this project holds any of the question's words\n");
+    }
+    Ok(json!({
+        "index": "words",
+        "mode": "semantic",
+        "total": files.len(),
+        "files": files.iter().map(|f| f.0.clone()).collect::<Vec<_>>(),
+        "fallback": why,
+        "text": text,
+    }))
 }
 
 /// How many chunks a plain English answer shows as text.
@@ -956,9 +1032,14 @@ fn coverage(question_words: &[String], text: &str) -> f64 {
 /// @param asked - the request
 fn semantic(index: &Index, asked: &FindRequest) -> Result<Value, Refusal> {
     let started = std::time::Instant::now();
-    let found = index
-        .passages(&asked.query, 30, None)
-        .map_err(|e| Refusal { code: "not-applicable", message: e })?;
+    // **A question the passage table cannot answer just now is answered from its words** (Unluminous
+    // `task-2200`: *"many of the tool calls fail with 'the index's store has stopped'"*). The passage table
+    // lives on the store thread, and while it is being built, while its file cannot be opened, or after a
+    // job on that thread failed, every plain English `find` was refused and the agent had nothing to go on.
+    let found = match index.passages(&asked.query, 30, None) {
+        Ok(found) => found,
+        Err(why) => return by_the_words(index, asked, &why),
+    };
     let with_vectors = index.status().vectors > 0;
     let question_words = crate::words::query_words(&asked.query);
     let mut chosen = Vec::new();
@@ -970,7 +1051,7 @@ fn semantic(index: &Index, asked: &FindRequest) -> Result<Value, Refusal> {
         let Some(content) = file_text(index, &hit.path) else { continue };
         let lines: Vec<&str> = content.split('\n').collect();
         let body = lines
-            .get(hit.start as usize - 1..(hit.end as usize).min(lines.len()))
+            .get((hit.start as usize).saturating_sub(1)..(hit.end as usize).min(lines.len()))
             .map(|l| l.join("\n"))
             .unwrap_or_default();
         let share = coverage(&question_words, &format!("{}\n{}", hit.header, body));
@@ -997,7 +1078,7 @@ fn semantic(index: &Index, asked: &FindRequest) -> Result<Value, Refusal> {
         .replace(" \n", "\n");
         let mut shown = 0;
         for (i, line) in
-            lines.iter().enumerate().take(hit.end as usize).skip(hit.start as usize - 1)
+            lines.iter().enumerate().take(hit.end as usize).skip((hit.start as usize).saturating_sub(1))
         {
             let lower = line.to_lowercase();
             if shown < 2 && question_words.iter().any(|w| lower.contains(w.as_str())) {
