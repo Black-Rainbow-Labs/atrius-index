@@ -488,6 +488,44 @@ fn indent_regions(text: &str, lines: &LineIndex) -> Vec<Region> {
 /// A heading inside a fenced code block is not a heading, which the reader already has to know
 /// because `#` is a comment in half the languages people put in fences.
 fn heading_regions(text: &str, lines: &LineIndex) -> Vec<Region> {
+    let levels = heading_levels(text, lines);
+    let mut found = Vec::new();
+    for (head, level) in levels.iter().enumerate() {
+        let Some(level) = level else { continue };
+        let mut end = lines.count();
+        for (line, below) in levels.iter().enumerate().skip(head + 1) {
+            if below.is_some_and(|deeper| deeper <= *level) {
+                end = line;
+                break;
+            }
+        }
+        // Trailing blank lines belong to whatever comes next, not to the section above them.
+        while end > head + 1 && indent_of(lines.text(text, end - 1)).is_none() {
+            end -= 1;
+        }
+        if end > head + 1 {
+            found.push(Region { head, body: head + 1..end, kind: Kind::Heading });
+        }
+    }
+    found
+}
+
+/// Every Markdown heading in `text`, as its line from zero and its level from one to six.
+///
+/// A region is only made for a heading with lines under it, so a heading followed straight away by
+/// another one has no region. The outline lists every heading whatever is under it, which is why it asks
+/// this rather than [`regions`].
+pub fn markdown_headings(text: &str) -> Vec<(usize, usize)> {
+    let lines = LineIndex::new(text);
+    heading_levels(text, &lines)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(line, level)| level.map(|level| (line, level)))
+        .collect()
+}
+
+/// The heading level of each line, or nothing for a line that is not a heading.
+fn heading_levels(text: &str, lines: &LineIndex) -> Vec<Option<usize>> {
     let mut levels: Vec<Option<usize>> = Vec::with_capacity(lines.count());
     let mut fence: Option<char> = None;
     for line in 0..lines.count() {
@@ -511,25 +549,7 @@ fn heading_regions(text: &str, lines: &LineIndex) -> Vec<Region> {
             (1..=6).contains(&hashes) && (rest.is_empty() || rest.starts_with(char::is_whitespace));
         levels.push(heading.then_some(hashes));
     }
-    let mut found = Vec::new();
-    for (head, level) in levels.iter().enumerate() {
-        let Some(level) = level else { continue };
-        let mut end = lines.count();
-        for (line, below) in levels.iter().enumerate().skip(head + 1) {
-            if below.is_some_and(|deeper| deeper <= *level) {
-                end = line;
-                break;
-            }
-        }
-        // Trailing blank lines belong to whatever comes next, not to the section above them.
-        while end > head + 1 && indent_of(lines.text(text, end - 1)).is_none() {
-            end -= 1;
-        }
-        if end > head + 1 {
-            found.push(Region { head, body: head + 1..end, kind: Kind::Heading });
-        }
-    }
-    found
+    levels
 }
 
 /// Which regions somebody has collapsed.

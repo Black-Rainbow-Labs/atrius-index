@@ -62,11 +62,27 @@ pub struct Chunk {
     pub body: String,
 }
 
+/// One heading of a Markdown file and the section under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Section {
+    /// The heading's line, from one.
+    pub line: u32,
+    /// The last line of the section, from one: the line before the next heading at the same level or
+    /// higher, less any blank lines at its end. The same as `line` for a heading with nothing under it.
+    pub end: u32,
+    /// From one for `#` to six for `######`.
+    pub level: u32,
+    /// The heading's line, trimmed, with its hashes: `## Context`.
+    pub heading: String,
+}
+
 /// What reading one file produced.
 #[derive(Debug, Default)]
 pub struct Outline {
     /// Every definition, in line order.
     pub definitions: Vec<Definition>,
+    /// Every heading of a Markdown file, in line order. Empty for any other file.
+    pub sections: Vec<Section>,
     /// The chunks, in line order, covering the whole file.
     pub chunks: Vec<Chunk>,
 }
@@ -115,13 +131,75 @@ pub fn read(rel: &str, text: &str, budget: usize) -> Outline {
         }
         _ => Vec::new(),
     };
+    let markdown = language.is_none() && rel.to_ascii_lowercase().ends_with(".md");
+    let sections = match markdown {
+        true => sections(text, &lines),
+        false => Vec::new(),
+    };
     let units = match &language {
         Some(_) => code_units(&lines, &definitions),
-        None if rel.to_ascii_lowercase().ends_with(".md") => section_units(text, &lines),
+        None if markdown => section_units(&lines, &sections),
         None => paragraph_units(&lines),
     };
-    let chunks = merge(rel, &lines, &units, &definitions, budget);
-    Outline { definitions, chunks }
+    let mut chunks = merge(rel, &lines, &units, &definitions, budget);
+    for chunk in &mut chunks {
+        name_the_sections(rel, chunk, &sections);
+    }
+    Outline { definitions, sections, chunks }
+}
+
+/// Every heading of a Markdown file with the section under it.
+///
+/// @param text - the file's text
+/// @param lines - its lines
+fn sections(text: &str, lines: &[&str]) -> Vec<Section> {
+    let headings = folding::markdown_headings(text);
+    headings
+        .iter()
+        .enumerate()
+        .map(|(at, &(line, level))| {
+            let mut end = headings[at + 1..]
+                .iter()
+                .find(|(_, below)| *below <= level)
+                .map_or(lines.len(), |(next, _)| *next);
+            while end > line + 1 && lines[end - 1].trim().is_empty() {
+                end -= 1;
+            }
+            Section {
+                line: line as u32 + 1,
+                end: end.max(line + 1) as u32,
+                level: level as u32,
+                heading: lines[line].trim().to_owned(),
+            }
+        })
+        .collect()
+}
+
+/// Names the sections a Markdown chunk sits in and holds in its header, and its first heading as its
+/// symbol, so a search word can match "which section" as a code chunk's header lets it match "which
+/// function". Nothing for a chunk of any other file, which has no sections.
+///
+/// @param rel - the file's path
+/// @param chunk - the chunk
+/// @param sections - the file's sections
+fn name_the_sections(rel: &str, chunk: &mut Chunk, sections: &[Section]) {
+    if sections.is_empty() {
+        return;
+    }
+    let mut named: Vec<&str> = sections
+        .iter()
+        .filter(|s| s.line < chunk.start && s.end >= chunk.start)
+        .map(|s| s.heading.as_str())
+        .collect();
+    let inside = sections.iter().filter(|s| s.line >= chunk.start && s.line <= chunk.end);
+    named.extend(inside.clone().take(4).map(|s| s.heading.as_str()));
+    if !named.is_empty() {
+        chunk.header = format!("{rel} | {}", named.join(" ; "));
+    }
+    if let Some(first) = inside.clone().next() {
+        chunk.kind = "section";
+        chunk.symbol = Some(first.heading.trim_start_matches('#').trim().to_owned());
+    }
 }
 
 /// Every definition in a file with its extent.
@@ -213,24 +291,29 @@ fn code_units(lines: &[&str], definitions: &[Definition]) -> Vec<Unit> {
     units
 }
 
-/// The units of a Markdown file: each top level heading's section, and the text before the first.
+/// The units of a Markdown file: each heading down to the next heading of any level, and the text before
+/// the first.
 ///
-/// @param text - the file's text
-/// @param lines - its lines
-fn section_units(text: &str, lines: &[&str]) -> Vec<Unit> {
-    let regions = folding::regions(text, Reading::Markdown);
+/// **Every heading starts a unit, not only the top level ones.** A `#` title's section is the whole of a
+/// document, so taking only the outermost sections left one unit for the file: over the budget, it was
+/// split at blank lines, and every `##` heading under the title was lost from the outline. That is
+/// `task-2207`'s report: an outline of a ticket with a title and five `##` sections answered the title on
+/// line 1 and a section with no name starting at a blank line 33. Small neighbouring sections are joined
+/// again by the merge, within the budget.
+///
+/// @param lines - the file's lines
+/// @param sections - its sections
+fn section_units(lines: &[&str], sections: &[Section]) -> Vec<Unit> {
     let mut units = Vec::new();
     let mut at = 0usize;
-    for r in regions.iter().filter(|r| r.kind == Kind::Heading) {
-        if r.head < at {
-            continue;
+    for (i, section) in sections.iter().enumerate() {
+        let head = section.line as usize - 1;
+        if head > at {
+            units.push(Unit { start: at, end: head - 1, kind: "other" });
         }
-        if r.head > at {
-            units.push(Unit { start: at, end: r.head - 1, kind: "other" });
-        }
-        let end = r.last().max(r.head).min(lines.len().saturating_sub(1));
-        units.push(Unit { start: r.head, end, kind: "section" });
-        at = end + 1;
+        let next = sections.get(i + 1).map_or(lines.len(), |s| s.line as usize - 1);
+        units.push(Unit { start: head, end: next.max(head + 1) - 1, kind: "section" });
+        at = next.max(head + 1);
     }
     if at < lines.len() {
         units.push(Unit { start: at, end: lines.len() - 1, kind: "other" });
@@ -374,6 +457,63 @@ fn make_chunk(rel: &str, lines: &[&str], unit: &Unit, definitions: &[Definition]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `task-2207`: a ticket with a `#` title and five `##` sections outlined as the title and a section
+    /// with no name at a blank line. Every heading is a section now, nested by level, and each ends at the
+    /// line before the next heading at its own level or higher.
+    #[test]
+    fn every_markdown_heading_is_a_section_whatever_its_level() {
+        let mut text = String::from("# OBWV2-3 Max exposure\n\nA line about the ticket.\n\n");
+        for name in ["Context", "Scope", "Deliverables", "Acceptance Criteria", "Links"] {
+            text.push_str(&format!("## {name}\n\n"));
+            for i in 0..30 {
+                text.push_str(&format!("- {name} item {i} with enough words to weigh something\n"));
+            }
+            text.push('\n');
+        }
+        text.push_str("### Nested\nunder links\n");
+        let read = read("tasks/ticket.md", &text, CHUNK_BUDGET);
+        let headings: Vec<(&str, u32)> =
+            read.sections.iter().map(|s| (s.heading.as_str(), s.level)).collect();
+        assert_eq!(
+            headings,
+            vec![
+                ("# OBWV2-3 Max exposure", 1),
+                ("## Context", 2),
+                ("## Scope", 2),
+                ("## Deliverables", 2),
+                ("## Acceptance Criteria", 2),
+                ("## Links", 2),
+                ("### Nested", 3),
+            ]
+        );
+        let lines = text.lines().count() as u32;
+        assert_eq!(read.sections[0].end, lines, "the title's section is the whole document");
+        assert_eq!(read.sections[1].line, 5);
+        assert_eq!(read.sections[1].end, 36, "Context ends before the blank line above Scope");
+        assert_eq!(read.sections[5].end, lines, "Links holds the nested heading under it");
+        // A chunk is never headed by a blank line, and every chunk that starts at a heading names it.
+        for chunk in &read.chunks {
+            let first = chunk.body.lines().next().unwrap_or_default();
+            assert!(!first.trim().is_empty(), "a chunk starts at a blank line: {chunk:?}");
+            if first.starts_with('#') {
+                assert!(chunk.header.contains(first.trim()), "{chunk:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_heading_with_nothing_under_it_is_still_listed() {
+        let read = read("notes.md", "# Title\n## Empty\n## Full\ntext\n", CHUNK_BUDGET);
+        let lines: Vec<(u32, u32)> = read.sections.iter().map(|s| (s.line, s.end)).collect();
+        assert_eq!(lines, vec![(1, 4), (2, 2), (3, 4)]);
+    }
+
+    #[test]
+    fn a_hash_in_a_fence_is_not_a_section() {
+        let read = read("notes.md", "# Title\n```sh\n# not a heading\n```\n", CHUNK_BUDGET);
+        assert_eq!(read.sections.len(), 1);
+    }
 
     #[test]
     fn a_rust_function_ends_where_its_block_ends_and_carries_its_doc_comment() {

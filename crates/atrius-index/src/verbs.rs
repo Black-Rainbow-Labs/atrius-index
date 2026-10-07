@@ -540,7 +540,7 @@ fn status(index: &Index) -> Value {
     let st = index.status();
     let (files, trigrams, bytes) =
         index.with_exact(|e| (e.live(), e.postings.len(), e.heap_bytes())).unwrap_or((0, 0, 0));
-    let text = format!(
+    let mut text = format!(
         "{} ({}), {} files, {} trigrams, {} MB in memory, {} gates, {} files read again\n{}\n",
         if st.ready { "ready" } else { "building" },
         st.origin,
@@ -551,9 +551,29 @@ fn status(index: &Index) -> Value {
         st.reindexed,
         st.file.display()
     );
+    // **Building is not the same as unsafe to search, and the status says so** (Unluminous `task-2207`).
+    // An agent read "building, 0 files" from its first status call and concluded the index was empty,
+    // while a `find` sent in the same batch had already answered in full: `find` reads the files
+    // directly until the index is ready, and every other verb waits for the index. Nothing in the status
+    // said either, so a caller had no way to tell when searching was safe. It always is; this says how.
+    let answered_by = if st.ready { "index" } else { "files" };
+    if !st.ready {
+        text.push_str("searching is safe now: find reads the files directly with the same results until the index is ready, and def, refs, files, outline and fragment wait for it\n");
+    }
+    if !st.passages_ready && st.store_error.is_none() {
+        text.push_str("a plain English question is answered from its words until the passage table is built\n");
+    }
+    if let Some(why) = &st.store_error {
+        text.push_str(&format!("store: {why}\n"));
+    }
+    if let Some(why) = &st.not_embedding {
+        text.push_str(&format!("not embedding: {why}\n"));
+    }
     json!({
         "root": index.root().to_string_lossy(),
         "ready": st.ready,
+        "searchable": true,
+        "answeredBy": answered_by,
         "origin": st.origin,
         "loadMs": st.load_ms as u64,
         "files": files,
@@ -884,14 +904,18 @@ fn outline(index: &Index, args: &Map<String, Value>) -> Result<Value, Refusal> {
     })?;
     let read = crate::outline::read(&rel, &content, crate::outline::CHUNK_BUDGET);
     let mut text = format!("{rel} ({} lines)\n", content.lines().count());
+    // A Markdown file's outline is its headings, every level, indented by level. It used to be read off
+    // the chunks, which are built for searching rather than for this, and a `#` title's chunk held the
+    // whole document, so no `##` heading under it was ever listed. `task-2207`.
     let rows: Vec<Value> = if read.definitions.is_empty() {
-        read.chunks
+        read.sections
             .iter()
-            .filter(|c| c.kind == "section")
-            .map(|c| {
-                let heading = c.body.lines().next().unwrap_or_default().trim().to_owned();
-                text.push_str(&format!("  {}: {}\n", c.start, heading));
-                json!({ "line": c.start, "end": c.end, "kind": "section", "signature": heading })
+            .map(|s| {
+                let depth = s.level.saturating_sub(1);
+                let indent = "  ".repeat(depth as usize + 1);
+                text.push_str(&format!("{indent}{}-{}: {}\n", s.line, s.end, s.heading));
+                let name = s.heading.trim_start_matches('#').trim();
+                json!({ "line": s.line, "end": s.end, "kind": "section", "name": name, "signature": s.heading, "depth": depth })
             })
             .collect()
     } else {

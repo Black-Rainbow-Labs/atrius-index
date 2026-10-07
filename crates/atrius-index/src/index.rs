@@ -122,7 +122,16 @@ impl Index {
         std::thread::Builder::new()
             .name("atrius-index-store".into())
             .spawn(move || {
-                store_thread(&thread_root, &thread_exact, &thread_symbols, &thread_status, rx)
+                // **A store thread that ends says why** (Unluminous `task-2207`). Everything that can panic
+                // on it is caught where it runs, below; this is for whatever is not, so that a search sent
+                // to a thread that has gone answers with the reason instead of `storeError: null`.
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    store_thread(&thread_root, &thread_exact, &thread_symbols, &thread_status, rx)
+                }));
+                if let Err(panic) = ran {
+                    lock(&thread_status).store_error =
+                        Some(format!("the store thread stopped: {}", panic_message(&panic)));
+                }
             })
             .expect("the store thread starts");
         freshness.mark_everything();
@@ -301,7 +310,10 @@ impl Index {
                 kind: kind.map(str::to_owned),
                 reply: tx,
             })
-            .map_err(|_| "the index's store has stopped".to_owned())?;
+            .map_err(|_| match lock(&self.status).store_error.clone() {
+                Some(why) => format!("the index's store has stopped: {why}"),
+                None => "the index's store has stopped".to_owned(),
+            })?;
         rx.recv_timeout(Duration::from_secs(30))
             .map_err(|_| "the passage search did not answer".to_owned())?
     }
@@ -392,8 +404,34 @@ fn store_thread(
             None => return,
         },
     };
-    build_passages(&store, exact, status, rebuilt);
-    let mut embedder = Embedder::open(&store, status);
+    // **Neither of these may end the thread** (Unluminous `task-2207`). An agent on macOS saw every plain
+    // English search answer "the index's store has stopped" with `passagesReady: true`, `canEmbed: false`
+    // and `storeError: null`: the passage table had been built, and the thread then ended before it had
+    // written anything down. The one thing between the two is `Embedder::open`, whose first act is to run
+    // `embed()` to find out whether a model is installed. A panic in either is written down now, and the
+    // thread goes on answering searches from the words.
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_passages(&store, exact, status, rebuilt)
+    }));
+    if let Err(panic) = built {
+        lock(status).store_error =
+            Some(format!("building the passage table panicked: {}", panic_message(&panic)));
+    }
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        tests::panic_if_asked(root);
+        Embedder::open(&store, status)
+    }));
+    let mut embedder = match opened {
+        Ok(embedder) => embedder,
+        Err(panic) => {
+            let mut st = lock(status);
+            st.can_embed = false;
+            st.not_embedding =
+                Some(format!("checking for the embedding model panicked: {}", panic_message(&panic)));
+            None
+        }
+    };
     loop {
         if let Some(job) = first_job.take() {
             run_a_job(&store, root, status, embedder.as_mut(), job);
@@ -582,6 +620,15 @@ impl Embedder {
     /// @param status - the status to update
     fn open(store: &Store, status: &Mutex<Status>) -> Option<Embedder> {
         let session = store.session();
+        // **Turned off means the model is not even looked for.** `ATRIUS_EMBED=off` used to be read after
+        // the probe below, which runs the model, so a machine where running it is the problem could not
+        // be told to skip it. `task-2207`.
+        if let Some(reason) = why_not_embed(0) {
+            let mut st = lock(status);
+            st.not_embedding = Some(reason);
+            st.vectors = passages::vector_counts(&session).0;
+            return None;
+        }
         let able = passages::can_embed(&session);
         let (vectors, _) = passages::vector_counts(&session);
         {
@@ -689,4 +736,68 @@ fn build_passages(
 pub fn strip_verbatim(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// The roots whose store thread is made to panic where it looks for the embedding model.
+    fn panicking_roots() -> &'static Mutex<Vec<PathBuf>> {
+        static ROOTS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+        ROOTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    /// Called on the store thread just before the embedder is opened: panics for a root a test named,
+    /// which is how a model that panics on this machine is stood in for on one that has none.
+    ///
+    /// @param root - the root the store thread serves
+    pub(super) fn panic_if_asked(root: &Path) {
+        if panicking_roots().lock().unwrap().iter().any(|r| r == root) {
+            panic!("the embedding probe failed on purpose");
+        }
+    }
+
+    /// `task-2207`: a store thread that met a panic where it looks for the embedding model ended, and every
+    /// plain English search after it answered "the index's store has stopped" with nothing written down.
+    /// The thread lives on now, says why it is not embedding, and answers from the passage table's words.
+    #[test]
+    fn a_panic_looking_for_the_model_leaves_the_store_answering_questions() {
+        static CACHE: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| tempfile::tempdir().unwrap());
+        std::env::set_var("ATRIUS_INDEX_CACHE", cache.path());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/route.ts"),
+            "// Decides whether an offer is sent to the v1 or the v2 service.\nexport function routeOffer(offer) {\n  return offer.version === 2 ? 'v2' : 'v1';\n}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/health.ts"), "export function health() { return 'ok'; }\n")
+            .unwrap();
+        let root = crate::host::canonical(&root);
+        panicking_roots().lock().unwrap().push(root.clone());
+
+        let index = Index::open_quietly(&root);
+        assert!(index.wait_ready(Duration::from_secs(60)));
+        let began = Instant::now();
+        while index.status().not_embedding.is_none() && began.elapsed() < Duration::from_secs(60) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let status = index.status();
+        assert!(
+            status.not_embedding.as_deref().is_some_and(|why| why.contains("panicked")),
+            "{:?}",
+            status.not_embedding
+        );
+        assert!(status.store_error.is_none(), "{:?}", status.store_error);
+        assert!(!status.can_embed);
+        let args = serde_json::json!({ "query": "where does an offer get routed to v1 or v2", "mode": "semantic" });
+        let answer = crate::verbs::answer(&index, "find", args.as_object().unwrap())
+            .expect("a question is answered");
+        assert_eq!(answer["index"], "passage", "{answer}");
+        assert!(answer["text"].as_str().unwrap().contains("src/route.ts"), "{answer}");
+    }
 }
