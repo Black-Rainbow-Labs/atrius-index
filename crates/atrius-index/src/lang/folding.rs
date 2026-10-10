@@ -197,7 +197,7 @@ pub fn regions_from(text: &str, reading: Reading<'_>, read: &Tokens) -> Vec<Regi
     // Indentation last, and only where nothing better already answers for that line. In a braces
     // language every block has both and the bracket's answer is the better one, because it knows
     // where the block closed; what is left over is the languages with no braces at all.
-    let already: Vec<usize> = found.iter().map(|region| region.head).collect();
+    let already: std::collections::HashSet<usize> = found.iter().map(|region| region.head).collect();
     for region in indent_regions(text, &lines) {
         if !already.contains(&region.head) {
             found.push(region);

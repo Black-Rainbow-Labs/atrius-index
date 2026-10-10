@@ -375,6 +375,17 @@ impl FileSymbols {
         }
     }
 
+    /// The comments and strings this reading found, as the folding reading wants them, so a caller
+    /// that has read a file for its definitions can read it for its blocks without a second scan
+    /// (Unluminous `task-2231` §5.2).
+    pub fn folding_tokens(&self) -> crate::lang::folding::Tokens {
+        let mut tokens = crate::lang::folding::Tokens::default();
+        for (range, role) in &self.quiet {
+            tokens.note(range.clone(), *role == Role::Comment);
+        }
+        tokens
+    }
+
     /// What this file defines, in the order the definitions appear in it.
     /// Every identifier-shaped token in the file, in order.
     ///
@@ -601,7 +612,7 @@ fn brace_follows(tail: &str, grammar: &Grammar) -> bool {
         let between = &rest_of_line[..brace];
         return between.is_empty() || (words_allowed && plain_tail(between));
     }
-    if !rest_of_line.is_empty() && !(words_allowed && plain_tail(rest_of_line)) {
+    if !(rest_of_line.is_empty() || (words_allowed && plain_tail(rest_of_line))) {
         return false;
     }
     if !grammar.brace_next_line {

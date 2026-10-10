@@ -14,13 +14,25 @@ use std::path::{Path, PathBuf};
 use inillucent_driver::{Connection, Database, OpenOptions, Value};
 
 use crate::exact::{block_id, pack_blocks, unpack_blocks, Exact, FileRecord};
+use crate::outline::Definition;
+use crate::structure::{Import, Kind, Parameter, Visibility};
+use crate::symbols::SymbolTable;
 use crate::trigram::{Posting, Postings};
+use std::collections::HashMap;
 
 /// The schema version of the tables this module writes. A different number rebuilds everything.
-pub const SCHEMA_VERSION: &str = "2";
+///
+/// `3` added the `symbol` and `import` tables (Unluminous `task-2231` §5.2), so an index written by an
+/// older version is rebuilt, which the recorded numbers put at 0.6 s on vite and 1.5 s on django.
+pub const SCHEMA_VERSION: &str = "3";
 /// The trigram engine's version: how bytes are folded and which trigrams are kept.
 pub const TRIGRAM_VERSION: &str = "1";
+/// The structural reading's version: what `crate::structure` takes out of a definition. A different
+/// number reads every file's definitions again rather than loading the `symbol` table.
+pub const SYMBOL_VERSION: &str = "1";
 
+/// The tables. `symbol` and `import` are keyed by the file's path rather than its id, because
+/// compaction gives every file a new id and the rows would otherwise all have to be written again.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS file (id INTEGER PRIMARY KEY, path TEXT UNIQUE, lang TEXT, size INTEGER,
@@ -29,6 +41,16 @@ CREATE TABLE IF NOT EXISTS file (id INTEGER PRIMARY KEY, path TEXT UNIQUE, lang 
 CREATE TABLE IF NOT EXISTS blob (content_hash BLOB PRIMARY KEY, bytes BLOB);
 CREATE TABLE IF NOT EXISTS trigram (tri INTEGER PRIMARY KEY, postings BLOB);
 CREATE TABLE IF NOT EXISTS trigram_delta (file_id INTEGER PRIMARY KEY, tris BLOB, tombstone INTEGER);
+CREATE TABLE IF NOT EXISTS symbol (id INTEGER PRIMARY KEY, path TEXT, ordinal INTEGER, name TEXT,
+    kind TEXT, container TEXT, signature TEXT, parameters TEXT, returns TEXT, type_text TEXT,
+    visibility TEXT, doc TEXT, line INTEGER, end_line INTEGER, start_line INTEGER, byte_start INTEGER,
+    byte_end INTEGER, likely INTEGER, depth INTEGER, exported INTEGER, member INTEGER);
+CREATE INDEX IF NOT EXISTS symbol_path ON symbol(path);
+CREATE INDEX IF NOT EXISTS symbol_name ON symbol(name);
+CREATE INDEX IF NOT EXISTS symbol_container ON symbol(container);
+CREATE TABLE IF NOT EXISTS import (id INTEGER PRIMARY KEY, path TEXT, ordinal INTEGER, segments TEXT,
+    alias TEXT, is_glob INTEGER, byte_start INTEGER, byte_end INTEGER);
+CREATE INDEX IF NOT EXISTS import_path ON import(path);
 ";
 
 /// The index file of one checkout.
@@ -271,6 +293,235 @@ impl Store {
         }
         Ok(Exact::restore(files, postings))
     }
+}
+
+impl Store {
+    /// Whether the stored `symbol` and `import` tables were written by this structural reading.
+    pub fn symbols_are_current(&self) -> bool {
+        self.exact_is_current() && self.meta("symbol_version").as_deref() == Some(SYMBOL_VERSION)
+    }
+
+    /// Writes every file's definitions and imports, replacing what was there, in one transaction.
+    ///
+    /// @param rows - each file's path, definitions and imports, as `SymbolTable::rows` copies them
+    pub fn save_symbols(&self, rows: &[(String, Vec<Definition>, Vec<Import>)]) -> Result<(), String> {
+        let session = self.session();
+        let tx = session.begin().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM symbol", &[]).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM import", &[]).map_err(|e| e.to_string())?;
+        for (path, defs, imports) in rows {
+            write_symbol_rows(&tx, path, defs)?;
+            write_import_rows(&tx, path, imports)?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('symbol_version', ?1)",
+            &[Value::Text(SYMBOL_VERSION.into())],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Replaces the rows of the files a gate read again and removes those of the files it removed.
+    ///
+    /// @param changed - each changed file's path, definitions and imports
+    /// @param removed - the paths of the removed files
+    pub fn save_symbol_changes(
+        &self,
+        changed: &[(String, Vec<Definition>, Vec<Import>)],
+        removed: &[String],
+    ) -> Result<(), String> {
+        let session = self.session();
+        let tx = session.begin().map_err(|e| e.to_string())?;
+        for path in removed.iter().chain(changed.iter().map(|c| &c.0)) {
+            for table in ["symbol", "import"] {
+                tx.execute(&format!("DELETE FROM {table} WHERE path = ?1"), &[Value::Text(path.clone())])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        for (path, defs, imports) in changed {
+            write_symbol_rows(&tx, path, defs)?;
+            write_import_rows(&tx, path, imports)?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Reads the symbol table back from the `symbol` and `import` tables, or `None` when they were
+    /// written by another structural reading and the definitions have to be read again.
+    pub fn load_symbols(&self) -> Result<Option<SymbolTable>, String> {
+        if !self.symbols_are_current() {
+            return Ok(None);
+        }
+        let session = self.session();
+        let rows = session
+            .query_all("SELECT path, name, kind, container, signature, parameters, returns, type_text, visibility, doc, line, end_line, start_line, byte_start, byte_end, likely, depth, exported, member FROM symbol ORDER BY path, ordinal", &[])
+            .map_err(|e| e.to_string())?;
+        let mut by_file: Vec<(String, Vec<Definition>)> = Vec::new();
+        for row in &rows.rows {
+            let path = text_at(row, 0).unwrap_or_default();
+            let definition = definition_from_row(row);
+            match by_file.last_mut() {
+                Some((last, defs)) if *last == path => defs.push(definition),
+                _ => by_file.push((path, vec![definition])),
+            }
+        }
+        let mut imports: HashMap<String, Vec<Import>> = HashMap::new();
+        let rows = session
+            .query_all("SELECT path, segments, alias, is_glob, byte_start, byte_end FROM import ORDER BY path, ordinal", &[])
+            .map_err(|e| e.to_string())?;
+        for row in &rows.rows {
+            let segments: Vec<String> =
+                serde_json::from_str(&text_at(row, 1).unwrap_or_default()).unwrap_or_default();
+            imports.entry(text_at(row, 0).unwrap_or_default()).or_default().push(Import {
+                path: segments,
+                alias: text_at(row, 2),
+                glob: int_at(row, 3) != 0,
+                range: int_at(row, 4) as usize..int_at(row, 5) as usize,
+            });
+        }
+        let mut table = SymbolTable::default();
+        for (path, defs) in by_file {
+            let own = imports.remove(&path).unwrap_or_default();
+            table.set_file_with_imports(&path, defs, own);
+        }
+        for (path, own) in imports {
+            table.set_file_with_imports(&path, Vec::new(), own);
+        }
+        Ok(Some(table))
+    }
+}
+
+/// The text in a column of a row, if it holds text.
+///
+/// @param row - the row
+/// @param at - the column
+fn text_at(row: &[Value], at: usize) -> Option<String> {
+    row.get(at).and_then(Value::text).map(str::to_owned)
+}
+
+/// The integer in a column of a row, or zero.
+///
+/// @param row - the row
+/// @param at - the column
+fn int_at(row: &[Value], at: usize) -> i64 {
+    match row.get(at) {
+        Some(Value::Integer(v)) => *v,
+        _ => 0,
+    }
+}
+
+/// A definition from a `symbol` row, in the column order `load_symbols` selects.
+///
+/// @param row - the row
+fn definition_from_row(row: &[Value]) -> Definition {
+    let kind = text_at(row, 2).and_then(|k| Kind::parse(&k)).unwrap_or(Kind::Variable);
+    let parameters: Vec<(String, Option<String>)> =
+        serde_json::from_str(&text_at(row, 5).unwrap_or_default()).unwrap_or_default();
+    Definition {
+        name: text_at(row, 1).unwrap_or_default(),
+        kind: kind.family(),
+        line: int_at(row, 10) as u32,
+        end: int_at(row, 11) as u32,
+        start: int_at(row, 12) as u32,
+        signature: text_at(row, 4).unwrap_or_default(),
+        likely: int_at(row, 15) != 0,
+        exported: int_at(row, 17) != 0,
+        depth: int_at(row, 16) as u32,
+        symbol_kind: kind,
+        container: text_at(row, 3),
+        parameters: parameters
+            .into_iter()
+            .map(|(name, type_text)| Parameter { name, type_text })
+            .collect(),
+        returns: text_at(row, 6),
+        type_text: text_at(row, 7),
+        visibility: text_at(row, 8)
+            .and_then(|v| Visibility::parse(&v))
+            .unwrap_or(Visibility::Private),
+        doc: text_at(row, 9),
+        range: int_at(row, 13) as usize..int_at(row, 14) as usize,
+        member: int_at(row, 18) != 0,
+    }
+}
+
+/// A value for an optional text column.
+///
+/// @param text - the text, if any
+fn optional(text: &Option<String>) -> Value {
+    match text {
+        Some(t) => Value::Text(t.clone()),
+        None => Value::Null,
+    }
+}
+
+/// Writes one file's `symbol` rows.
+///
+/// @param tx - the open transaction
+/// @param path - the file's path
+/// @param defs - its definitions
+fn write_symbol_rows(
+    tx: &inillucent_driver::Transaction<'_>,
+    path: &str,
+    defs: &[Definition],
+) -> Result<(), String> {
+    for (ordinal, d) in defs.iter().enumerate() {
+        let parameters: Vec<(&str, Option<&str>)> =
+            d.parameters.iter().map(|p| (p.name.as_str(), p.type_text.as_deref())).collect();
+        tx.execute(
+            "INSERT INTO symbol (path, ordinal, name, kind, container, signature, parameters, returns, type_text, visibility, doc, line, end_line, start_line, byte_start, byte_end, likely, depth, exported, member) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            &[
+                Value::Text(path.to_owned()),
+                Value::Integer(ordinal as i64),
+                Value::Text(d.name.clone()),
+                Value::Text(d.symbol_kind.name().to_owned()),
+                optional(&d.container),
+                Value::Text(d.signature.clone()),
+                Value::Text(serde_json::to_string(&parameters).unwrap_or_default()),
+                optional(&d.returns),
+                optional(&d.type_text),
+                Value::Text(d.visibility.name().to_owned()),
+                optional(&d.doc),
+                Value::Integer(i64::from(d.line)),
+                Value::Integer(i64::from(d.end)),
+                Value::Integer(i64::from(d.start)),
+                Value::Integer(d.range.start as i64),
+                Value::Integer(d.range.end as i64),
+                Value::Integer(i64::from(d.likely)),
+                Value::Integer(i64::from(d.depth)),
+                Value::Integer(i64::from(d.exported)),
+                Value::Integer(i64::from(d.member)),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Writes one file's `import` rows.
+///
+/// @param tx - the open transaction
+/// @param path - the file's path
+/// @param imports - its imports
+fn write_import_rows(
+    tx: &inillucent_driver::Transaction<'_>,
+    path: &str,
+    imports: &[Import],
+) -> Result<(), String> {
+    for (ordinal, i) in imports.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO import (path, ordinal, segments, alias, is_glob, byte_start, byte_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                Value::Text(path.to_owned()),
+                Value::Integer(ordinal as i64),
+                Value::Text(serde_json::to_string(&i.path).unwrap_or_default()),
+                optional(&i.alias),
+                Value::Integer(i64::from(i.glob)),
+                Value::Integer(i.range.start as i64),
+                Value::Integer(i.range.end as i64),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Writes one `file` row.

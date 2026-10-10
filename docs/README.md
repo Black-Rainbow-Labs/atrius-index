@@ -25,7 +25,7 @@ a page uses a phrase that [Writing style](writing-style.md) lists.
 | 5 | [MCP](mcp.md) | The `atrius_search` tool, how to register `atrius-mcp` with Claude Code, Cursor, VS Code and other agents, and what an agent sees |
 | 6 | [The background service](service.md) | Keeping chosen checkouts indexed at all times on Windows, macOS and Linux, the watch list, and `atrius doctor` |
 | 7 | [Configuration](configuration.md) | Where the index and the settings live, and every environment variable |
-| 8 | [Languages](languages.md) | The 24 languages Atrius reads definitions in, the manifest format, and adding a language |
+| 8 | [Languages](languages.md) | The 24 languages Atrius reads definitions in, the manifest format including the structural keys, and adding a language |
 | 9 | [Using the library](library.md) | Embedding the `atrius-index` crate in a Rust program, as Unluminous does |
 
 ## How it works

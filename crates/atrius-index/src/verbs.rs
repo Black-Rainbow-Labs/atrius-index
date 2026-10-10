@@ -615,7 +615,36 @@ fn is_identifier(query: &str) -> bool {
 ///
 /// @param d - the definition
 fn definition_value(d: &crate::symbols::Defined) -> Value {
-    json!({ "path": d.path, "line": d.definition.line, "end": d.definition.end, "kind": d.definition.kind, "name": d.definition.name, "signature": d.definition.signature })
+    let mut value = json!({ "path": d.path, "line": d.definition.line, "end": d.definition.end, "kind": d.definition.kind, "name": d.definition.name, "signature": d.definition.signature });
+    add_structure(&mut value, &d.definition);
+    value
+}
+
+/// Adds what the structural reading found about a definition to its row (Unluminous `task-2231` §6.10):
+/// its finer kind, its container, its parameters and return type, a field's or variable's type, its
+/// visibility and the first line of its documentation. A part that was not found is left out, so a row
+/// for a language that names none of the structural keys is the row it always was.
+///
+/// @param value - the row
+/// @param d - the definition
+fn add_structure(value: &mut Value, d: &crate::outline::Definition) {
+    value["symbolKind"] = json!(d.symbol_kind.name());
+    value["visibility"] = json!(d.visibility.name());
+    if let Some(container) = &d.container {
+        value["container"] = json!(container);
+    }
+    if d.symbol_kind.is_callable() {
+        value["parameters"] = json!(d.parameter_text());
+    }
+    if let Some(returns) = &d.returns {
+        value["returns"] = json!(returns);
+    }
+    if let Some(type_text) = &d.type_text {
+        value["typeText"] = json!(type_text);
+    }
+    if let Some(doc) = &d.doc {
+        value["doc"] = json!(doc);
+    }
 }
 
 /// `search def`: where a name is defined, best first, with each definition's signature line.
@@ -921,7 +950,9 @@ fn outline(index: &Index, args: &Map<String, Value>) -> Result<Value, Refusal> {
     } else {
         read.definitions.iter().filter(|d| crate::outline::is_listed(d)).map(|d| {
             text.push_str(&format!("{}{}-{}: {}\n", "  ".repeat(d.depth as usize + 1), d.line, d.end, shape::trim_line(&d.signature, "")));
-            json!({ "line": d.line, "end": d.end, "kind": d.kind, "name": d.name, "signature": d.signature, "depth": d.depth })
+            let mut row = json!({ "line": d.line, "end": d.end, "kind": d.kind, "name": d.name, "signature": d.signature, "depth": d.depth });
+            add_structure(&mut row, d);
+            row
         }).collect()
     };
     if rows.is_empty() {
@@ -1001,7 +1032,13 @@ fn fragment(index: &Index, args: &Map<String, Value>) -> Result<Value, Refusal> 
     if end < lines.len() as u32 {
         text.push_str(&format!("  … {} more lines in the file\n", lines.len() as u32 - end));
     }
-    Ok(json!({ "path": rel, "start": start, "end": end, "header": header, "text": text }))
+    let mut answer = json!({ "path": rel, "start": start, "end": end, "header": header, "text": text });
+    if let Some(d) = definition {
+        let mut row = json!({ "name": d.name, "line": d.line, "kind": d.kind, "signature": d.signature });
+        add_structure(&mut row, d);
+        answer["definition"] = row;
+    }
+    Ok(answer)
 }
 
 /// The share of a question's words the best chunk must hold before passage search will answer with

@@ -17,7 +17,7 @@ atrius find where do we retry a failed write
 | Speed | 32x to 40x faster than the ripgrep inside Claude Code on three repositories, 140x on the Linux kernel, held in the agent's MCP process |
 | Exactness | the same lines as ripgrep on all 2,200 queries over 19 open source repositories in 13 languages, and on all 468 held out agent grep patterns in the study |
 | Freshness | 0 stale results after edits, renames, deletes, bursts of thousands of files and branch switches |
-| Languages | definitions in 24 languages, from manifests anyone can extend |
+| Languages | definitions in 24 languages, with kinds, containers, parameters, types and imports, from manifests anyone can extend |
 | Platforms | Windows, macOS and Linux, with an optional background service on each |
 
 ## Install

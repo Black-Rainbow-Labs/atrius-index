@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.2.0
+
+- A structural reading of every definition. Each definition now has a kind (one of 16: `function`,
+  `method`, `type`, `struct`, `enum`, `variant`, `trait`, `interface`, `class`, `field`, `constant`,
+  `variable`, `module`, `parameter`, `alias` and `macro`), the container it is inside, its parameters with
+  their types, its return type, the type of a variable or field, its visibility (`public`, `crate` or
+  `private`), and the first line of its documentation. An `impl X for Y` gives the container `Y`, and a Go
+  receiver gives the type it names. Fields, enum variants and interface methods are listed as members.
+- Each file's import statements are read into paths with an alias and a glob flag: Rust `use`, quoted
+  imports in TypeScript and JavaScript, and Go imports.
+- Nine new manifest keys describe how a language writes these parts: `language.containers`,
+  `language.records`, `language.enums`, `language.annotation`, `language.returns`, `language.visibility`,
+  `language.kinds`, `language.members` and `language.receivers`. A manifest that names a visibility
+  other than `public`, `crate` or `private`, or a kind that is not one of the 16, is refused with a
+  message. All 16 bundled languages that define symbols set them. A language that names none of them is
+  read as before.
+- `def`, `outline` and `fragment` rows in JSON carry `symbolKind`, `visibility`, `container`,
+  `parameters`, `returns`, `typeText` and `doc` when they are known. `kind` is still the family it was.
+  `fragment` adds a `definition` object when it returns one short definition.
+- The definitions of every file are held in a symbol table with lookups by name, file, container, name
+  prefix, later word and initials, and the imports of each file.
+- The index file has schema version `3`, with a `symbol` table and an `import` table keyed by the file's
+  path. An index written by an earlier release is built again once. The tables load from the file when
+  they are current, so a host that starts with an index file does not read every file again for its
+  definitions.
+- New library calls: `Index::try_symbols`, which never waits, `Index::symbols_ready`,
+  `Index::keep_fresh`, `Index::open_in_memory` and `outline::read_structure`. `outline::Definition` has
+  the new fields `symbol_kind`, `container`, `parameters`, `returns`, `type_text`, `visibility`, `doc`,
+  `range` and `member`, and the method `parameter_text()`. `outline::Outline` has an `imports` field.
+
 ## 0.1.2
 
 - `outline` lists every heading of a Markdown file, at every level, nested by level, with the line each

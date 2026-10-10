@@ -113,6 +113,34 @@ where each one ends. `def` ranks exact spellings first, sure definitions before 
 project's source before tests, examples and documentation. `outline` and `fragment` read the same
 definitions. [Languages](languages.md) has the details.
 
+#### The structural reading
+
+`structure.rs` reads more about each definition than its name and lines. For each one it records a kind
+(one of 16, such as `method`, `struct`, `field` or `alias`), the container it is inside, its parameters
+with their types, its return type, the type of a variable or field, its visibility (`public`, `crate` or
+`private`) and the first line of its documentation. A field, a variant and an interface method are
+marked as members. The reading also takes each file's import statements apart into paths, with an alias
+and a glob flag for each.
+
+The reading is still not a parser. It works from the tokeniser's words, the definitions a definer
+keyword introduces, and the blocks folding finds, and a set of manifest keys tells it how a language
+writes containers, annotations, return types and visibility. The keys are in
+[Languages](languages.md#the-structural-keys). A language that names none of them is read as before.
+
+#### The symbol table
+
+The definitions of every file are held in one `SymbolTable` in memory. It answers by name, by file, by
+container (`members_of`), by name prefix (`prefixed`), by the start of a later word in a name
+(`word_started`), by the initials of a name (`humped`), and by each file's imports (`imports_of` and
+`all_imports`). A caller that must never wait, such as an editor reading names on every keystroke, uses
+`Index::try_symbols`, which returns nothing while the table is being written or is not built yet. See
+[Using the library](library.md).
+
+The table is saved in the index file. A host that starts with a current index file loads the table from
+it instead of reading every file's definitions again. If the saved table is missing or was written by
+another version of the structural reading, the host reads the files and saves the table once the index
+is answering.
+
 ### Passages: questions in plain English
 
 Each file is cut into chunks, one per definition where a language is known and by heading or size
@@ -174,8 +202,18 @@ tree once in the background, because files may have changed while no host was ru
 | `trigram` | each trigram's posting list, compressed |
 | `trigram_delta` | changes since the posting lists were last compacted |
 | `passage` | the `inillucent_search` table of chunks |
+| `symbol` | one row per definition: path, name, kind, container, signature, parameters, return type, type, visibility, documentation, lines, byte range and flags |
+| `import` | one row per import statement: path, the segments, the alias, whether it is a glob, and its byte range |
 
-A change in the schema version or the trigram version makes the next host build the index again.
+A change in the schema version or the trigram version makes the next host build the index again. The
+schema version is `3`. Version `3` added the `symbol` and `import` tables, so an index written by an
+earlier release is built again once. The `symbol` and `import` tables have a version of their own,
+`symbol_version` in `meta`, currently `1`. When it differs, the host reads every file's definitions again
+and writes the two tables, and the rest of the index is kept.
+
+The `symbol` and `import` rows are keyed by the file's path and not by the file's id. Compaction gives
+every file a new id, and with path keys the rows stay as they are. A change to one file replaces that
+file's rows alone.
 
 ## The wire protocol
 

@@ -133,7 +133,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "def",
-        summary: "Where a name is defined: each definition's path, line and signature line, the likeliest first.",
+        summary: "Where a name is defined: each definition's path, line and signature line, the likeliest first. With --json a row also has its kind, container, parameters, return type, visibility and doc comment where the language gives them.",
         arguments: &[one("name", "The name: a function, type, constant or module. `Type::name` and `Type.name` narrow it to a member.")],
         flags: &[
             number("limit", "number", "How many definitions to list. 10 by default."),
@@ -170,7 +170,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "outline",
-        summary: "A file's definitions, or a Markdown file's headings, one line each with their line ranges.",
+        summary: "A file's definitions, or a Markdown file's headings, one line each with their line ranges. With --json a definition also has its kind, container, parameters, return type, visibility and doc comment.",
         arguments: &[one("path", "The file.")],
         flags: &[STRUCTURED],
         examples: &["atrius outline src/layout.rs", "atrius outline README.md --json"],

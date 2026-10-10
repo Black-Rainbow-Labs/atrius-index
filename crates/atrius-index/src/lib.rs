@@ -24,6 +24,7 @@ pub mod plan;
 pub mod protocol;
 pub mod shape;
 pub mod store;
+pub mod structure;
 pub mod symbols;
 pub mod trigram;
 pub mod verbs;

@@ -110,8 +110,98 @@ language.definition_tail   = true
 | `language.export_keyword` | The word that makes a definition visible to other files, such as `export` or `pub` |
 | `language.markup` | `true` for a markup language such as HTML |
 
+The [structural keys](#the-structural-keys) below describe what a definition belongs to and what types it
+has.
+
 `language.brace_next_line` and `language.definition_tail` exist only in Atrius. The other keys are the
 same as in Unluminous's language plugins, so a manifest written for one reads in the other.
+
+## The structural keys
+
+```text
+language.containers = impl, trait, struct, enum, mod
+language.records    = struct
+language.enums      = enum
+language.annotation = :
+language.returns    = ->
+language.visibility = pub=public, pub(crate)=crate, pub(super)=crate
+language.kinds      = struct=struct, enum=enum, trait=trait, type=alias
+language.members    = ., ::
+```
+
+Those lines are from `rust.conf`. Besides each definition's name and lines, Atrius reads what a definition
+belongs to, what it takes and returns, what type a field or a variable has, who may use it, and the first
+line of its documentation. There is still no parser. The reading uses the words, comments and strings the
+tokeniser already finds, the definitions a definer keyword introduces, and the blocks folding finds from
+brackets or indentation. The keys below tell it how a language writes those parts. Every key is optional.
+A language that names none of them keeps its definitions with their names, kinds and lines, and the
+definitions have no container, parameters or types.
+
+| Key | Value | Meaning |
+|---|---|---|
+| `language.containers` | A comma list of words | The words a block's head line starts with when the block holds members, such as `impl, trait, struct, enum, mod` in Rust and `class, interface, enum, namespace` in TypeScript. The name on the head line is the container of every definition directly inside the block. `impl Trait for Type` names `Type`. A function inside a container that is not a module is a method. |
+| `language.records` | A comma list of container words | The containers whose blocks list fields, one a line, as `name: Type`. Each such line is a definition of kind `field`. |
+| `language.enums` | A comma list of container words | The containers whose blocks list variants, one a line. Each is a definition of kind `variant`. |
+| `language.annotation` | One word | What stands between a name and its type: `:` in Rust, TypeScript and Python. The word `space` means the type follows the name after a space, as in Go. |
+| `language.returns` | One word | What stands between a parameter list and its return type: `->` in Rust and Python, `:` in TypeScript. The word `space` means the type follows the parameter list after a space, as in Go. |
+| `language.visibility` | `word=public`, `word=crate` or `word=private` pairs | The words that say who may use a definition. A word with no `=` means private, so `private, protected=crate` is TypeScript's list. |
+| `language.kinds` | `keyword=kind` pairs | The finer kind a definer keyword makes, such as `struct=struct, enum=enum, trait=trait, type=alias`. A definer not named here keeps the kind `language.definers` gave it. |
+| `language.members` | A comma list of operators | What reaches a member of a value or a module: `., ::` in Rust and `., ?.` in TypeScript. |
+| `language.receivers` | `true` or `false` | `true` when a function's receiver is written in brackets before its name, as in Go's `func (s *Server) Start()`. The function is then a method of `Server`. |
+
+Atrius refuses a manifest, with a message, in two cases. `language.visibility` holds a level other than
+`public`, `crate` or `private`. `language.kinds` holds an entry with no `=`, or a kind that is not one of
+the sixteen: `function`, `method`, `type`, `struct`, `enum`, `variant`, `trait`, `interface`, `class`,
+`field`, `constant`, `variable`, `module`, `parameter`, `alias` and `macro`. A type alias has the kind
+`alias`.
+
+Go shows the two `space` values and the receiver key together:
+
+```text
+language.containers = type
+language.records    = type
+language.annotation = space
+language.returns    = space
+language.receivers  = true
+language.kinds      = type=type
+language.members    = .
+```
+
+A language whose `language.visibility` names no `public` word, such as TypeScript, treats a definition
+inside a type as public unless a private word is on its line. A language that names a `public` word, such as
+Rust, treats a definition as private unless that word is on its line or the export keyword marks it.
+
+The 16 bundled languages that define symbols name these keys. TypeScript, Python and Go are the examples to
+read after Rust.
+
+### Imports
+
+Atrius also reads each file's import statements into a list of paths. The keys that decide what an import
+statement is are the older ones: `language.imports`, `language.import_keywords`, `language.import_extensions`,
+`language.import_index`, `language.import_omit_extension` and `language.path_roots`. A path import such as
+Rust's `use crate::layout::{Layout as L}` becomes the segments `crate`, `layout`, `Layout` with the alias
+`L`. A quoted import such as `import { a } from './m'` becomes the specifier `./m` followed by `a`. A glob,
+such as `import * as m from './m'`, is marked as a glob. The library gives each import
+as an `Import` with `path`, `alias`, `glob` and `range`. See [Using the library](library.md).
+
+### What a definition row holds
+
+`def`, `outline` and `fragment` print these fields in their JSON rows when they are known. A field that was
+not found is left out of the row.
+
+| Field | Holds |
+|---|---|
+| `kind` | The family of the definition: `function`, `type`, `constant`, `variable`, `module`, `field` or `variant`. This is the field older rows had. |
+| `symbolKind` | The finer kind, one of the sixteen above. Always present. |
+| `visibility` | `public`, `crate` or `private`. Always present. |
+| `container` | The type or module whose block holds the definition |
+| `parameters` | A callable's parameters as text, such as `ui: &mut Ui, at: Pos2` |
+| `returns` | A callable's return type as written |
+| `typeText` | A field's or variable's type, as written or as its constructor names it |
+| `doc` | The first line of the comment above the definition, or of a Python docstring under it |
+
+`parameters` is present only for a function, a method or a macro. `fragment` puts these fields in a
+`definition` object when the lines it returns are one short definition.
 
 ## Adding a language
 

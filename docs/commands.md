@@ -10,10 +10,10 @@ an agent calls them.
 | Command | What it does |
 |---|---|
 | [`find`](#find) | Search the code: the same lines ripgrep would print for a literal or a regex, grouped by file and cut to a token budget, from an index kept current as files change. |
-| [`def`](#def) | Where a name is defined: each definition's path, line and signature line, the likeliest first. |
+| [`def`](#def) | Where a name is defined: each definition's path, line and signature line, the likeliest first. With --json a row also has its kind, container, parameters, return type, visibility and doc comment where the language gives them. |
 | [`refs`](#refs) | Every use of a name, grouped by file, the checkout's own source before tests and docs, and in each file the lines that define it first. |
 | [`fragment`](#fragment) | The function or section around a line, with line numbers and the signatures that enclose it, so it can be read without reading the whole file. |
-| [`outline`](#outline) | A file's definitions, or a Markdown file's headings, one line each with their line ranges. |
+| [`outline`](#outline) | A file's definitions, or a Markdown file's headings, one line each with their line ranges. With --json a definition also has its kind, container, parameters, return type, visibility and doc comment. |
 | [`files`](#files) | Files whose path matches a name, a part of one, or a glob, best match first. |
 | [`status`](#status) | Whether the index of the checkout is ready, how many files it holds, how much memory it uses, where its file is and which process hosts it. |
 | [`serve`](#serve) | Run the index host for a checkout in this terminal. A query starts one on its own when none is running, so this is only needed to start it ahead of time or to watch it. |
@@ -71,7 +71,7 @@ atrius find where do we retry a failed write
 
 ### def
 
-Where a name is defined: each definition's path, line and signature line, the likeliest first.
+Where a name is defined: each definition's path, line and signature line, the likeliest first. With --json a row also has its kind, container, parameters, return type, visibility and doc comment where the language gives them.
 
 ```
 atrius def <name> [--limit <number>] [--path <path>] [--structured] [--root <folder>] [--json]
@@ -153,7 +153,7 @@ atrius fragment backend/src/main.ts --line 40 --context 5
 
 ### outline
 
-A file's definitions, or a Markdown file's headings, one line each with their line ranges.
+A file's definitions, or a Markdown file's headings, one line each with their line ranges. With --json a definition also has its kind, container, parameters, return type, visibility and doc comment.
 
 ```
 atrius outline <path> [--structured] [--root <folder>] [--json]

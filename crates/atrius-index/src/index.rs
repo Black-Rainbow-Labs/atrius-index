@@ -29,6 +29,8 @@ enum StoreJob {
         removed: Vec<u32>,
         removed_paths: Vec<String>,
         next_id: usize,
+        /// Each changed file's definitions and imports, as the gate read them.
+        symbols: Vec<(String, Vec<crate::outline::Definition>, Vec<crate::structure::Import>)>,
     },
     /// A whole index to write, made by compaction, so the store thread writes it without any lock.
     Full { index: Box<Exact> },
@@ -105,6 +107,25 @@ impl Index {
     ///
     /// @param root - the checkout's root
     pub fn open_quietly(root: &Path) -> Index {
+        Index::open_with(root, true)
+    }
+
+    /// Opens an index that is held in memory alone: nothing is read from or written to the index file,
+    /// there is no passage table, and plain English questions are answered from their words.
+    ///
+    /// For a program that wants the definitions and must not touch the person's cache, such as an editor
+    /// a test builds (Unluminous `task-2231` §5.2), and for one that is not the checkout's host.
+    ///
+    /// @param root - the checkout's root
+    pub fn open_in_memory(root: &Path) -> Arc<Index> {
+        Arc::new(Index::open_with(root, false))
+    }
+
+    /// Opens an index, with or without its file.
+    ///
+    /// @param root - the checkout's root
+    /// @param on_disk - whether the index file is read and written
+    fn open_with(root: &Path, on_disk: bool) -> Index {
         let root = std::fs::canonicalize(root)
             .map(|p| strip_verbatim(&p))
             .unwrap_or_else(|_| root.to_path_buf());
@@ -126,7 +147,10 @@ impl Index {
                 // on it is caught where it runs, below; this is for whatever is not, so that a search sent
                 // to a thread that has gone answers with the reason instead of `storeError: null`.
                 let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    store_thread(&thread_root, &thread_exact, &thread_symbols, &thread_status, rx)
+                    match on_disk {
+                        true => store_thread(&thread_root, &thread_exact, &thread_symbols, &thread_status, rx),
+                        false => memory_thread(&thread_root, &thread_exact, &thread_symbols, &thread_status, rx),
+                    }
                 }));
                 if let Err(panic) = ran {
                     lock(&thread_status).store_error =
@@ -197,12 +221,27 @@ impl Index {
         let mut guard = self.exact.write().expect("exact");
         let exact = guard.as_mut()?;
         let report = self.freshness.gate(exact);
+        // Read before the table's lock is taken, so a reader that only tries the lock (the window's
+        // completion, on every keystroke) is never kept waiting while files are read.
+        let read: Vec<(String, symbols::Read)> = report
+            .changed
+            .iter()
+            .map(|(_, record, _)| {
+                let read = symbols::structure_of(record)
+                    .unwrap_or(symbols::Read { definitions: Vec::new(), imports: Vec::new() });
+                (record.rel.clone(), read)
+            })
+            .collect();
+        let changed_symbols: Vec<_> = read
+            .iter()
+            .map(|(path, r)| (path.clone(), r.definitions.clone(), r.imports.clone()))
+            .collect();
         if let Some(table) = self.symbols.write().expect("symbols").as_mut() {
             for path in &report.removed_paths {
                 table.remove_file(path);
             }
-            for (_, record, _) in &report.changed {
-                table.set_file(&record.rel, symbols::definitions_of(record).unwrap_or_default());
+            for (path, read) in read {
+                table.set_file_with_imports(&path, read.definitions, read.imports);
             }
         }
         if !report.changed.is_empty() || !report.removed.is_empty() {
@@ -212,6 +251,7 @@ impl Index {
                 removed: report.removed.clone(),
                 removed_paths: report.removed_paths.clone(),
                 next_id,
+                symbols: changed_symbols,
             });
             if exact.tombstones() > exact.live() / 2 + 1000
                 && !self.compacting.swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -329,6 +369,41 @@ impl Index {
         Some(work(symbols.as_ref()?, exact.as_ref()?))
     }
 
+    /// Runs a closure over the symbol table **without the gate and without waiting**: None while the
+    /// table is not built yet, or while a gate is writing to it at this very moment.
+    ///
+    /// For a caller that must never be kept waiting, such as an editor reading names on every keystroke
+    /// (Unluminous `task-2231` §5.2). Such a caller keeps the table fresh with [`Index::keep_fresh`]
+    /// rather than gating on every read.
+    ///
+    /// @param work - what to do with the table
+    pub fn try_symbols<T>(&self, work: impl FnOnce(&SymbolTable) -> T) -> Option<T> {
+        let guard = self.symbols.try_read().ok()?;
+        guard.as_ref().map(work)
+    }
+
+    /// Whether the symbol table has been built or loaded.
+    pub fn symbols_ready(&self) -> bool {
+        self.symbols.read().map(|s| s.is_some()).unwrap_or(false)
+    }
+
+    /// Starts a thread that runs the gate whenever the watcher has seen a change, at most once an
+    /// interval, so a reader that uses [`Index::try_symbols`] sees a file's new definitions within an
+    /// interval of it being written. The thread ends when the index is dropped.
+    ///
+    /// @param index - the index
+    /// @param interval - how often to look
+    pub fn keep_fresh(index: &Arc<Index>, interval: Duration) {
+        let weak = Arc::downgrade(index);
+        let _ = std::thread::Builder::new().name("atrius-index-fresh".into()).spawn(move || loop {
+            std::thread::sleep(interval);
+            let Some(index) = weak.upgrade() else { return };
+            if index.status().ready && index.freshness.pending() > 0 {
+                index.gate();
+            }
+        });
+    }
+
     /// Runs a closure over the loaded exact index, after the gate. None while it is not loaded.
     ///
     /// @param work - what to do with the index
@@ -369,7 +444,16 @@ fn store_thread(
             }
         }
     }
-    let table = SymbolTable::build(&index);
+    // **The symbol table is loaded from the file when it can be** (Unluminous `task-2231` §5.2), which is
+    // what lets the first keystroke after a project opens answer from the whole project. When the file
+    // holds none, or one another structural reading wrote, it is read from the files and written down
+    // once the index is answering.
+    let loaded = match (&store, origin) {
+        (Ok(s), "loaded") => s.load_symbols().ok().flatten(),
+        _ => None,
+    };
+    let save_symbols = loaded.is_none();
+    let table = loaded.unwrap_or_else(|| SymbolTable::build(&index));
     *exact.write().expect("exact") = Some(index);
     *symbol_table.write().expect("symbols") = Some(table);
     {
@@ -410,6 +494,14 @@ fn store_thread(
     // written anything down. The one thing between the two is `Embedder::open`, whose first act is to run
     // `embed()` to find out whether a model is installed. A panic in either is written down now, and the
     // thread goes on answering searches from the words.
+    if save_symbols || rebuilt {
+        // Copied under the read lock and written with no lock held, so a gate is never kept waiting
+        // behind a write of every definition in the project.
+        let rows = symbol_table.read().ok().and_then(|t| t.as_ref().map(SymbolTable::rows));
+        if let Some(Err(e)) = rows.map(|rows| store.save_symbols(&rows)) {
+            lock(status).store_error = Some(e);
+        }
+    }
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         build_passages(&store, exact, status, rebuilt)
     }));
@@ -466,6 +558,40 @@ fn store_thread(
             },
         };
         run_a_job(&store, root, status, embedder.as_mut(), job);
+    }
+}
+
+/// The store thread of an index held in memory: builds the exact index and the symbol table, then
+/// answers every passage search with the reason there is none and ignores the batches of changes, which
+/// the gates have already applied in memory.
+///
+/// @param root - the root
+/// @param exact - where the built index goes
+/// @param symbol_table - where the symbol table goes
+/// @param status - the status to update
+/// @param jobs - what the gates and the searches send
+fn memory_thread(
+    root: &Path,
+    exact: &RwLock<Option<Exact>>,
+    symbol_table: &RwLock<Option<SymbolTable>>,
+    status: &Mutex<Status>,
+    jobs: std::sync::mpsc::Receiver<StoreJob>,
+) {
+    let started = Instant::now();
+    let index = Exact::build(root);
+    let table = SymbolTable::build(&index);
+    *exact.write().expect("exact") = Some(index);
+    *symbol_table.write().expect("symbols") = Some(table);
+    {
+        let mut st = lock(status);
+        st.ready = true;
+        st.origin = "memory".into();
+        st.load_ms = started.elapsed().as_millis();
+    }
+    while let Ok(job) = jobs.recv() {
+        if let StoreJob::Search { reply, .. } = job {
+            let _ = reply.send(Err("this index is held in memory and has no passage table".into()));
+        }
     }
 }
 
@@ -547,10 +673,11 @@ fn run_a_job(
         e.pending = true;
     }
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
-        StoreJob::Changes { changed, removed, removed_paths, next_id } => {
+        StoreJob::Changes { changed, removed, removed_paths, next_id, symbols } => {
             let records: Vec<&FileRecord> = changed.iter().map(|c| &c.1).collect();
             store
                 .save_changes(&changed, &removed, next_id)
+                .and_then(|()| store.save_symbol_changes(&symbols, &removed_paths))
                 .and_then(|()| passages::update(&store.session(), &removed_paths, &records))
         }
         StoreJob::Full { index } => store.save_exact(&index, root),

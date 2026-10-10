@@ -247,6 +247,45 @@ pub struct Grammar {
     /// language nothing claims. Checking it would mean one plugin refusing to load because another
     /// was switched off.
     pub raw_text: Vec<(String, Option<String>)>,
+    /// How the language writes the parts of a definition the structural reading takes apart: which
+    /// blocks hold members, what separates a name from its type, and the rest of Unluminous `task-2231`
+    /// §5.2's keys. Every one is off unless a language names it.
+    pub structure: StructureKeys,
+}
+
+/// The manifest keys `crate::structure` reads (Unluminous `task-2231` §5.2), every one optional.
+///
+/// They are kept apart from the rest of [`Grammar`] because nothing but the structural reading asks
+/// them, and a language that names none of them is read exactly as it was before they existed: its
+/// definitions keep their names, kinds and lines and simply have no container, parameters or types.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StructureKeys {
+    /// `language.containers`: the words a block's head line starts with when the block holds members,
+    /// such as `impl, trait, struct, enum, mod` for Rust and `class, interface, enum, namespace` for
+    /// TypeScript. The block's name is the container of every definition directly inside it.
+    pub containers: Vec<String>,
+    /// `language.records`: the container words whose blocks list fields, one a line, as `name: Type`.
+    pub records: Vec<String>,
+    /// `language.enums`: the container words whose blocks list variants, one a line.
+    pub enums: Vec<String>,
+    /// `language.annotation`: what stands between a name and its type, `:` in Rust, TypeScript and
+    /// Python, or `space` where the type simply follows the name, as in Go.
+    pub annotation: Option<String>,
+    /// `language.returns`: what stands between a parameter list and its return type: `->` in Rust and
+    /// Python, `:` in TypeScript, or `space` in Go.
+    pub returns: Option<String>,
+    /// `language.visibility`: the words that say who may use a definition and what they mean, as
+    /// `word=public|crate|private`, such as `pub=public, pub(crate)=crate`. A bare word means private.
+    pub visibility: Vec<(String, String)>,
+    /// `language.kinds`: a definer keyword and the finer kind it makes, such as `struct=struct,
+    /// enum=enum, trait=trait`. A definer not named here keeps the kind `language.definers` gave it.
+    pub kinds: Vec<(String, String)>,
+    /// `language.members`: what reaches a member of a value or a module: `., ::` for Rust and
+    /// `., ?.` for TypeScript.
+    pub members: Vec<String>,
+    /// `language.receivers`: true when a function's receiver is written in brackets before its name,
+    /// as Go's `func (s *Server) Start()`, which makes it a method of `Server`.
+    pub receivers: bool,
 }
 
 /// How a language writes the module an import names.

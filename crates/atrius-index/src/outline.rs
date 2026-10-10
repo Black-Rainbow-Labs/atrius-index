@@ -43,6 +43,40 @@ pub struct Definition {
     pub exported: bool,
     /// How many other definitions it sits inside.
     pub depth: u32,
+    /// What it is, finer than `kind`: a method, a struct, a field (Unluminous `task-2231` §5.2).
+    pub symbol_kind: crate::structure::Kind,
+    /// The type or module whose block holds it.
+    pub container: Option<String>,
+    /// A callable's parameters.
+    pub parameters: Vec<crate::structure::Parameter>,
+    /// A callable's return type, as written.
+    pub returns: Option<String>,
+    /// A field's or variable's type, as written or as its constructor names it.
+    pub type_text: Option<String>,
+    /// Who may use it.
+    pub visibility: crate::structure::Visibility,
+    /// The first line of its documentation.
+    pub doc: Option<String>,
+    /// The name's own bytes.
+    pub range: std::ops::Range<usize>,
+    /// True for a field, a variant or an interface's method: a member the structural reading found
+    /// rather than a definer keyword. The chunking and the chunk headers leave these out, so the passage
+    /// table is exactly what it was before they existed.
+    pub member: bool,
+}
+
+impl Definition {
+    /// The parameter list as a person writes it: `ui: &mut Ui, at: Pos2`.
+    pub fn parameter_text(&self) -> String {
+        self.parameters
+            .iter()
+            .map(|p| match &p.type_text {
+                Some(t) => format!("{}: {t}", p.name),
+                None => p.name.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// One chunk of a file.
@@ -85,6 +119,8 @@ pub struct Outline {
     pub sections: Vec<Section>,
     /// The chunks, in line order, covering the whole file.
     pub chunks: Vec<Chunk>,
+    /// The file's import statements, taken apart (Unluminous `task-2231` §5.2).
+    pub imports: Vec<crate::structure::Import>,
 }
 
 /// Whether a definition is one worth listing and looking up by name: anything at the top level, and
@@ -125,11 +161,11 @@ fn weight(line: &str) -> usize {
 pub fn read(rel: &str, text: &str, budget: usize) -> Outline {
     let lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
     let language = grammars::for_path(rel);
-    let definitions = match &language {
+    let (definitions, imports) = match &language {
         Some(language) if language.grammar.defines_symbols() => {
             definitions(text, &lines, &language.grammar)
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), Vec::new()),
     };
     let markdown = language.is_none() && rel.to_ascii_lowercase().ends_with(".md");
     let sections = match markdown {
@@ -145,7 +181,24 @@ pub fn read(rel: &str, text: &str, budget: usize) -> Outline {
     for chunk in &mut chunks {
         name_the_sections(rel, chunk, &sections);
     }
-    Outline { definitions, sections, chunks }
+    Outline { definitions, sections, chunks, imports }
+}
+
+/// A file's definitions and imports alone, without the chunks and sections [`read`] also makes.
+///
+/// What an editor reads an open tab with on each change of its text (Unluminous `task-2231` §5.2), where
+/// chunking the file for passage search would be work nobody asked for.
+///
+/// @param rel - the file's path, which decides its language
+/// @param text - the file's text
+pub fn read_structure(rel: &str, text: &str) -> (Vec<Definition>, Vec<crate::structure::Import>) {
+    match grammars::for_path(rel) {
+        Some(language) if language.grammar.defines_symbols() => {
+            let lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+            definitions(text, &lines, &language.grammar)
+        }
+        _ => (Vec::new(), Vec::new()),
+    }
 }
 
 /// Every heading of a Markdown file with the section under it.
@@ -211,41 +264,82 @@ fn definitions(
     text: &str,
     lines: &[&str],
     grammar: &crate::lang::syntax::Grammar,
-) -> Vec<Definition> {
+) -> (Vec<Definition>, Vec<crate::structure::Import>) {
     let symbols = FileSymbols::read(text, grammar);
-    let regions = folding::regions(text, Reading::Code(grammar));
+    let regions = folding::regions_from(text, Reading::Code(grammar), &symbols.folding_tokens());
     let line_starts: Vec<usize> =
         std::iter::once(0).chain(text.match_indices('\n').map(|(i, _)| i + 1)).collect();
-    let mut out: Vec<Definition> = Vec::new();
-    for d in symbols.definitions() {
-        let line0 = line_starts.partition_point(|&s| s <= d.name_range.start).saturating_sub(1);
-        let end0 = regions
+    let structure = crate::structure::read(text, grammar, &symbols, &regions);
+    let extent = |line0: usize| {
+        // The regions are sorted by head line, so the ones that open on this line or the next two are a
+        // binary search away rather than a walk of every block in the file.
+        let from = regions.partition_point(|r| r.head < line0);
+        let end0 = regions[from..]
             .iter()
-            .filter(|r| {
-                matches!(r.kind, Kind::Block | Kind::Indent)
-                    && r.head >= line0
-                    && r.head <= line0 + 2
-            })
+            .take_while(|r| r.head <= line0 + 2)
+            .find(|r| matches!(r.kind, Kind::Block | Kind::Indent))
             .map(|r| r.last())
-            .next()
             .unwrap_or(line0);
         let mut start0 = line0;
         while start0 > 0 && is_preamble(lines[start0 - 1]) {
             start0 -= 1;
         }
+        (start0, end0.max(line0))
+    };
+    let signature_of = |line0: usize| -> String {
+        lines.get(line0).map(|l| l.trim().chars().take(200).collect()).unwrap_or_default()
+    };
+    let mut out: Vec<Definition> = Vec::new();
+    for (d, shape) in symbols.definitions().iter().zip(structure.shapes) {
+        // `import { type ReactNode }` names something defined elsewhere; the definer keyword inside an
+        // import is not a definition.
+        if structure.imports.iter().any(|i| i.range.contains(&d.name_range.start)) {
+            continue;
+        }
+        let line0 = line_starts.partition_point(|&s| s <= d.name_range.start).saturating_sub(1);
+        let (start0, end0) = extent(line0);
         out.push(Definition {
             name: text[d.name_range.clone()].to_owned(),
-            kind: d.kind.name(),
+            kind: shape.kind.family(),
             line: line0 as u32 + 1,
-            end: end0.max(line0) as u32 + 1,
+            end: end0 as u32 + 1,
             start: start0 as u32 + 1,
-            signature: lines
-                .get(line0)
-                .map(|l| l.trim().chars().take(200).collect())
-                .unwrap_or_default(),
+            signature: signature_of(line0),
             likely: d.confidence == Confidence::Likely,
             exported: d.exported,
             depth: 0,
+            symbol_kind: shape.kind,
+            container: shape.container,
+            parameters: shape.parameters,
+            returns: shape.returns,
+            type_text: shape.type_text,
+            visibility: shape.visibility,
+            doc: shape.doc,
+            range: d.name_range.clone(),
+            member: false,
+        });
+    }
+    for member in structure.members {
+        let line0 = member.line;
+        out.push(Definition {
+            name: member.name,
+            kind: member.shape.kind.family(),
+            line: line0 as u32 + 1,
+            end: line0 as u32 + 1,
+            start: extent(line0).0 as u32 + 1,
+            signature: signature_of(line0),
+            likely: false,
+            exported: member.shape.visibility == crate::structure::Visibility::Public,
+            depth: 0,
+            symbol_kind: member.shape.kind,
+            container: member.shape.container,
+            parameters: member.shape.parameters,
+            returns: member.shape.returns,
+            type_text: member.shape.type_text,
+            visibility: member.shape.visibility,
+            doc: member.shape.doc,
+            range: member.range,
+            member: true,
         });
     }
     out.sort_by_key(|d| (d.line, std::cmp::Reverse(d.end)));
@@ -255,7 +349,7 @@ fn definitions(
             out[..i].iter().filter(|o| o.line < line && o.end >= end && o.end > o.line).count()
                 as u32;
     }
-    out
+    (out, structure.imports)
 }
 
 /// A run of lines that belongs together: a definition, a heading's section, or what is between them.
@@ -274,7 +368,7 @@ struct Unit {
 fn code_units(lines: &[&str], definitions: &[Definition]) -> Vec<Unit> {
     let mut units = Vec::new();
     let mut at = 0usize;
-    for d in definitions.iter().filter(|d| d.depth == 0) {
+    for d in definitions.iter().filter(|d| d.depth == 0 && !d.member) {
         let (start, end) = (d.start as usize - 1, d.end as usize - 1);
         if start < at {
             continue;
@@ -398,7 +492,7 @@ fn split(lines: &[&str], unit: &Unit, definitions: &[Definition], budget: usize)
     let cuts: Vec<usize> = (unit.start + 1..=unit.end)
         .filter(|&i| {
             lines[i].trim().is_empty()
-                || definitions.iter().any(|d| d.start as usize - 1 == i && d.depth > 0)
+                || definitions.iter().any(|d| d.start as usize - 1 == i && d.depth > 0 && !d.member)
         })
         .collect();
     let mut out = Vec::new();
@@ -428,9 +522,9 @@ fn split(lines: &[&str], unit: &Unit, definitions: &[Definition], budget: usize)
 fn make_chunk(rel: &str, lines: &[&str], unit: &Unit, definitions: &[Definition]) -> Chunk {
     let (s, e) = (unit.start as u32 + 1, unit.end as u32 + 1);
     let inside: Vec<&Definition> =
-        definitions.iter().filter(|d| d.line >= s && d.line <= e).collect();
+        definitions.iter().filter(|d| !d.member && d.line >= s && d.line <= e).collect();
     let enclosing: Vec<&Definition> =
-        definitions.iter().filter(|d| d.line < s && d.end >= s).collect();
+        definitions.iter().filter(|d| !d.member && d.line < s && d.end >= s).collect();
     let mut signatures: Vec<String> = enclosing.iter().map(|d| d.signature.clone()).collect();
     signatures.extend(
         inside

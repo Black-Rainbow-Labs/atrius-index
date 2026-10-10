@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::lang::symbols::SymbolKind;
-use crate::lang::syntax::{Grammar, ImportStyle, PathRoot};
+use crate::lang::syntax::{Grammar, ImportStyle, PathRoot, StructureKeys};
 
 /// Named values read from or written to the settings file.
 ///
@@ -212,6 +212,49 @@ pub fn language_grammar(values: &Values, name: &str) -> Result<Grammar, String> 
         // The two `task-1694` added, and the same rule a sixth time.
         markup: values.flag("language.markup").unwrap_or(false),
         raw_text: raw_text(values)?,
+        structure: structure_keys(values)?,
+    })
+}
+
+/// The structural keys (Unluminous `task-2231` §5.2), each checked so a manifest that names a kind or a
+/// visibility this version does not have is refused with the list, as `language.definers` is.
+///
+/// @param values - the manifest
+fn structure_keys(values: &Values) -> Result<StructureKeys, String> {
+    let mut visibility = Vec::new();
+    for (word, level) in pairs(values, "language.visibility") {
+        let level = level.unwrap_or_else(|| "private".to_owned());
+        if !["public", "crate", "private"].contains(&level.as_str()) {
+            return Err(format!(
+                "language.visibility says `{word}={level}`, and a visibility is public, crate or private"
+            ));
+        }
+        visibility.push((word, level));
+    }
+    let mut kinds = Vec::new();
+    for (keyword, kind) in pairs(values, "language.kinds") {
+        let Some(kind) = kind else {
+            return Err(format!("language.kinds holds `{keyword}`, which is not `keyword=kind`"));
+        };
+        if crate::structure::Kind::parse(&kind).is_none() {
+            let known: Vec<&str> = crate::structure::Kind::ALL.iter().map(|k| k.name()).collect();
+            return Err(format!(
+                "language.kinds says `{keyword}={kind}`, and a kind is one of {}",
+                known.join(", ")
+            ));
+        }
+        kinds.push((keyword, kind));
+    }
+    Ok(StructureKeys {
+        containers: list(values, "language.containers"),
+        records: list(values, "language.records"),
+        enums: list(values, "language.enums"),
+        annotation: word(values, "language.annotation"),
+        returns: word(values, "language.returns"),
+        visibility,
+        kinds,
+        members: list(values, "language.members"),
+        receivers: values.flag("language.receivers").unwrap_or(false),
     })
 }
 
