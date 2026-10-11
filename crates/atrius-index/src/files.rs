@@ -75,8 +75,31 @@ pub fn walker(root: &Path, start: &Path, depth: Option<usize>) -> WalkBuilder {
 /// @param start - the folder inside the root to walk
 /// @param depth - how deep to go, None for all the way
 pub fn walk_under(root: &Path, start: &Path, depth: Option<usize>) -> Vec<Found> {
+    // **The walk starts at the root and goes down only the path to `start`**, because a walk that
+    // starts inside a folder the rules leave out never asks about that folder: the `ignore` crate matches
+    // each entry it reaches and never the folders above the start. So a change under
+    // `target/debug/deps` walked that folder on its own, `/target` never matched, and every build
+    // artifact was indexed (Unluminous `task-2247`: an index of 11.7 GB, read whole into a window).
+    let Ok(inside) = start.strip_prefix(root) else {
+        return collect(walker(root, start, depth), root);
+    };
+    let below = inside.components().count();
+    let mut builder = walker(root, root, depth.map(|d| d + below));
+    let start = start.to_path_buf();
+    builder.filter_entry(move |entry| {
+        let path = entry.path();
+        start.starts_with(path) || path.starts_with(&start)
+    });
+    collect(builder, root)
+}
+
+/// Runs a walk and answers the files it found, sorted by path.
+///
+/// @param builder - the walk
+/// @param root - the root the paths are made relative to
+fn collect(builder: WalkBuilder, root: &Path) -> Vec<Found> {
     let found = Mutex::new(Vec::new());
-    walker(root, start, depth).build_parallel().run(|| {
+    builder.build_parallel().run(|| {
         let found = &found;
         Box::new(move |entry| {
             let Ok(entry) = entry else { return WalkState::Continue };

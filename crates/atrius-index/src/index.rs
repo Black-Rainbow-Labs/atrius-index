@@ -429,7 +429,7 @@ fn store_thread(
     jobs: std::sync::mpsc::Receiver<StoreJob>,
 ) {
     let started = Instant::now();
-    let store = Store::open(&store::index_folder(root));
+    let store = Store::open_replacing_an_old_one(&store::index_folder(root));
     let (index, origin) = match &store {
         Ok(s) if s.exact_is_current() => match s.load_exact() {
             Ok(loaded) => (loaded, "loaded"),

@@ -91,3 +91,44 @@ fn a_line_of_code_in_auto_mode_is_searched_as_text_when_it_is_not_a_regex() {
     // Asked for as a regex, it is still refused.
     assert!(atrius_index::verbs::answer(&index, "find", &find("fn main() {", "regex")).is_err());
 }
+
+/// How many rows a table of the store holds.
+fn rows_in(store: &atrius_index::store::Store, table: &str) -> i64 {
+    let rows = store.session().query_all(&format!("SELECT count(*) FROM {table}"), &[]).unwrap();
+    match rows.rows[0][0] {
+        inillucent_driver::Value::Integer(n) => n,
+        _ => panic!("a count"),
+    }
+}
+
+/// Unluminous `task-2247`: a blob is a whole file's content, and every version of every file that
+/// changed was kept for ever. The Unluminous checkout's index had reached 11.7 GB of them.
+#[test]
+fn a_file_that_changes_keeps_one_blob_and_a_removed_file_keeps_none() {
+    use atrius_index::exact::{Exact, FileRecord};
+    use atrius_index::store::Store;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("checkout");
+    a_project(&root);
+    let store = Store::open(&dir.path().join("index")).unwrap();
+    let mut exact = Exact::build(&root);
+    store.save_exact(&exact, &root).unwrap();
+    assert_eq!(rows_in(&store, "blob"), 3);
+    for round in 0..6 {
+        let (record, trigrams) = FileRecord::from_bytes(
+            "src/main.rs".into(),
+            round,
+            format!("fn main() {{ round_{round}(); }}\n").as_bytes(),
+        );
+        let old = exact.by_path["src/main.rs"];
+        exact.remove("src/main.rs");
+        exact.insert(record.clone(), &trigrams);
+        let id = exact.files.len() as u32 - 1;
+        store.save_changes(&[(id, record, trigrams)], &[old], exact.files.len()).unwrap();
+    }
+    assert_eq!(rows_in(&store, "blob"), 3, "one blob for each file, whatever it used to hold");
+    let gone = exact.by_path["src/handler.rs"];
+    exact.remove("src/handler.rs");
+    store.save_changes(&[], &[gone], exact.files.len()).unwrap();
+    assert_eq!(rows_in(&store, "blob"), 2, "a removed file's content goes with it");
+}

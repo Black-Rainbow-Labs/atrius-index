@@ -24,7 +24,13 @@ use std::collections::HashMap;
 ///
 /// `3` added the `symbol` and `import` tables (Unluminous `task-2231` §5.2), so an index written by an
 /// older version is rebuilt, which the recorded numbers put at 0.6 s on vite and 1.5 s on django.
-pub const SCHEMA_VERSION: &str = "3";
+///
+/// `4` is the same tables. It is raised so every index written before the watcher obeyed the ignore rules
+/// of the folders above a change is replaced: those hold a project's whole build output and every version
+/// of every file, and the Unluminous checkout's had reached 11.7 GB (Unluminous `task-2247`). A file of an
+/// older version is deleted and made again rather than emptied, because emptying it leaves the file its
+/// size on disk.
+pub const SCHEMA_VERSION: &str = "4";
 /// The trigram engine's version: how bytes are folded and which trigrams are kept.
 pub const TRIGRAM_VERSION: &str = "1";
 /// The structural reading's version: what `crate::structure` takes out of a definition. A different
@@ -38,6 +44,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS file (id INTEGER PRIMARY KEY, path TEXT UNIQUE, lang TEXT, size INTEGER,
     mtime_ns INTEGER, content_hash BLOB, generation INTEGER, is_binary INTEGER, is_generated INTEGER,
     line_count INTEGER);
+CREATE INDEX IF NOT EXISTS file_content ON file(content_hash);
 CREATE TABLE IF NOT EXISTS blob (content_hash BLOB PRIMARY KEY, bytes BLOB);
 CREATE TABLE IF NOT EXISTS trigram (tri INTEGER PRIMARY KEY, postings BLOB);
 CREATE TABLE IF NOT EXISTS trigram_delta (file_id INTEGER PRIMARY KEY, tris BLOB, tombstone INTEGER);
@@ -106,6 +113,28 @@ impl Store {
         let database = Database::open_with(&path, options).map_err(|e| e.to_string())?;
         database.session().execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         Ok(Store { database, path })
+    }
+
+    /// Opens the index file in a folder, first deleting it when an older schema wrote it, so a rebuild
+    /// starts from an empty file rather than from one the size of everything it ever held. A file that
+    /// cannot be deleted, because another process still has it open, is opened as it is and emptied by
+    /// the rebuild instead.
+    ///
+    /// @param folder - the index folder of one checkout
+    pub fn open_replacing_an_old_one(folder: &Path) -> Result<Store, String> {
+        let store = Store::open(folder)?;
+        let written_by = store.meta("schema_version");
+        if written_by.is_none() || written_by.as_deref() == Some(SCHEMA_VERSION) {
+            return Ok(store);
+        }
+        drop(store);
+        let Ok(entries) = std::fs::read_dir(folder) else { return Store::open(folder) };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("index.rdb") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        Store::open(folder)
     }
 
     /// The file's path.
@@ -207,6 +236,27 @@ impl Store {
         next_id: usize,
     ) -> Result<(), String> {
         let session = self.session();
+        // The content of every file row this batch takes away, so a blob nothing names any more is
+        // deleted with it. Nothing did that before, and a blob is a whole file's content: a project
+        // whose files changed often enough kept every version of every one of them (`task-2247`).
+        let mut orphans: Vec<Vec<u8>> = Vec::new();
+        let mut note_the_content = |sql: &str, key: Value| {
+            if let Ok(rows) = session.query_all(sql, &[key]) {
+                orphans.extend(rows.rows.iter().filter_map(|row| row.first()?.bytes().map(<[u8]>::to_vec)));
+            }
+        };
+        for &id in removed {
+            note_the_content(
+                "SELECT content_hash FROM file WHERE id = ?1",
+                Value::Integer(i64::from(id)),
+            );
+        }
+        for (_, record, _) in changed {
+            note_the_content(
+                "SELECT content_hash FROM file WHERE path = ?1",
+                Value::Text(record.rel.clone()),
+            );
+        }
         let tx = session.begin().map_err(|e| e.to_string())?;
         for &id in removed {
             tx.execute("DELETE FROM file WHERE id = ?1", &[Value::Integer(i64::from(id))])
@@ -224,6 +274,15 @@ impl Store {
             .map_err(|e| e.to_string())?;
             let tris = pack_trigrams(trigrams);
             tx.execute("INSERT OR REPLACE INTO trigram_delta (file_id, tris, tombstone) VALUES (?1, ?2, 0)", &[Value::Integer(i64::from(*id)), Value::Blob(tris)]).map_err(|e| e.to_string())?;
+        }
+        orphans.sort();
+        orphans.dedup();
+        for hash in orphans {
+            tx.execute(
+                "DELETE FROM blob WHERE content_hash = ?1 AND NOT EXISTS (SELECT 1 FROM file WHERE content_hash = ?1)",
+                &[Value::Blob(hash)],
+            )
+            .map_err(|e| e.to_string())?;
         }
         tx.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('next_id', ?1)",

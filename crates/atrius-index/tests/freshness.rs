@@ -110,6 +110,12 @@ fn every_kind_of_change_is_seen_by_the_next_query() {
     write(&root, "src/new_file.rs", "fn created() { fresh_token_create(); }\n");
     failures.extend(differences(&rg, &index, "a new file", &["fresh_token_create", "fn created"]));
 
+    // Unluminous `task-2247`: a change deep inside an ignored folder was walked from that folder, where
+    // the rule naming the folder above it is never asked, so a build's whole output was indexed.
+    write(&root, "target/debug/deps/artifact.rs", "fn built() { build_output_token(); }\n");
+    write(&root, "target/release/build/out.txt", "build_output_token again\n");
+    failures.extend(differences(&rg, &index, "a build writing into an ignored folder", &["build_output_token", "fn built"]));
+
     write(&root, "pkg3/module_3.rs", "/// Module 3, edited.\npub fn handler_3(input: u32) -> u32 {\n    fresh_token_edit(input)\n}\n");
     failures.extend(differences(&rg, &index, "an edited file", &["fresh_token_edit", "handler_3", "Module 3"]));
 
