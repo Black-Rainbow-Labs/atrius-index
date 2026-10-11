@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1
+
+- A change inside a folder the ignore rules leave out is no longer indexed. The watcher walked a changed
+  folder starting at that folder, so the rule naming a folder above it, such as `/target`, was never
+  asked. Every build added its output to the index: one Rust checkout held 22,386 files of `target`
+  output, its index file was 11.7 GB, and a host that opened it read the file whole into memory. A
+  changed folder is now walked from the root down to that folder, under the same rules as the first walk.
+- A file's stored content is deleted when the file changes or is removed and no other file has the same
+  content. Before, every version of every file was kept.
+- The index file has schema version `4`. The tables are the same. An index file written by an earlier
+  release is deleted and built again, so the space the faults above took is given back.
+
 ## 0.2.0
 
 - A structural reading of every definition. Each definition now has a kind (one of 16: `function`,
