@@ -385,6 +385,19 @@ pub fn match_query(question: &str) -> Option<String> {
     )
 }
 
+/// Lets go of the search index the passage table built in memory to answer a question.
+///
+/// The `inillucent_search` module merges every segment of the table into one index the first time it is
+/// searched and keeps it until a transaction that wrote the table ends, which a read never does. On a
+/// 2,000 file checkout that index is 115 MB, held for the life of the process after one plain English
+/// question (Unluminous `task-2279`). A write that changes no row ends such a transaction, and the module
+/// forgets the index; the next question builds it again, which took half a second there.
+///
+/// @param conn - a connection on the store thread
+pub fn let_go_of_the_search_index(conn: &Connection<'_>) -> Result<(), String> {
+    conn.execute("DELETE FROM passage WHERE rowid = -1", &[]).map(|_| ()).map_err(|e| e.to_string())
+}
+
 /// The chunks that best answer a question, best first.
 ///
 /// With no kind given, code and tests come before documents. A question asked in English shares far

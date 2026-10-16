@@ -67,6 +67,9 @@ pub struct Status {
     pub can_embed: bool,
     /// Why the vectors are not being made although `embed()` can run, when that is so.
     pub not_embedding: Option<String>,
+    /// Whether the passage table's search index is held in memory, which it is from a plain English
+    /// question until the questions have stopped for a while (Unluminous `task-2279`).
+    pub search_index_held: bool,
     /// The index file.
     pub file: PathBuf,
 }
@@ -253,6 +256,8 @@ impl Index {
                 next_id,
                 symbols: changed_symbols,
             });
+            // The store and the symbol table have what they need from the files just read.
+            exact.let_go_of(report.changed.iter().map(|(id, _, _)| *id));
             if exact.tombstones() > exact.live() / 2 + 1000
                 && !self.compacting.swap(true, std::sync::atomic::Ordering::SeqCst)
             {
@@ -297,13 +302,13 @@ impl Index {
             (Arc::clone(&self.exact), self.store.clone(), Arc::clone(&self.compacting));
         let _ =
             std::thread::Builder::new().name("atrius-index-compact".into()).spawn(move || {
-                let taken =
-                    exact.read().expect("exact").as_ref().map(|e| {
-                        (e.files.iter().flatten().cloned().collect::<Vec<_>>(), e.generation)
-                    });
-                if let Some((records, generation)) = taken {
-                    let mut fresh = Exact::from_records(records);
+                let taken = exact.read().expect("exact").as_ref().map(|e| {
+                    (e.files.iter().flatten().cloned().collect::<Vec<_>>(), e.generation, e.root.clone())
+                });
+                if let Some((records, generation, root)) = taken {
+                    let mut fresh = Exact::from_records(records, root.as_deref());
                     let copy = fresh.clone();
+                    fresh.let_go_of_content();
                     let mut guard = exact.write().expect("exact");
                     if guard.as_ref().is_some_and(|e| e.generation == generation) {
                         fresh.generation = generation;
@@ -430,7 +435,7 @@ fn store_thread(
 ) {
     let started = Instant::now();
     let store = Store::open_replacing_an_old_one(&store::index_folder(root));
-    let (index, origin) = match &store {
+    let (mut index, origin) = match &store {
         Ok(s) if s.exact_is_current() => match s.load_exact() {
             Ok(loaded) => (loaded, "loaded"),
             Err(_) => (Exact::build(root), "built"),
@@ -454,6 +459,7 @@ fn store_thread(
     };
     let save_symbols = loaded.is_none();
     let table = loaded.unwrap_or_else(|| SymbolTable::build(&index));
+    index.root = Some(root.to_path_buf());
     *exact.write().expect("exact") = Some(index);
     *symbol_table.write().expect("symbols") = Some(table);
     {
@@ -524,11 +530,40 @@ fn store_thread(
             None
         }
     };
+    // **The content is let go of once everything that reads it has** (Unluminous `task-2279`): the store
+    // has the files, the symbol table and the passage table are built. See `exact::set_holding_content`.
+    if let Some(index) = exact.write().expect("exact").as_mut() {
+        index.let_go_of_content();
+    }
+    // **And the file's pool goes back to small**, unless the embedder has passages to write. A batch of
+    // changes, a compaction and embedding open it large again for as long as they take.
+    let mut store = store;
+    if !embedder.as_ref().is_some_and(|e| e.pending) {
+        let _ = store.reopen_with(store::cache_frames());
+    }
     // Whether the embedder is missing because the switch is off, rather than because there is no model.
-    let mut switched_off = !embedding_enabled();
+    // Read from what opening it said rather than from the switch now, because the switch may have been
+    // turned on while the store was being set up, and then the embedder was never opened.
+    let mut switched_off = lock(status).not_embedding.as_deref() == Some(SWITCHED_OFF);
+    // When the passage table was last searched, while the index it built for that is still held.
+    let mut searched: Option<Instant> = None;
     loop {
+        // **The index a question built is let go of once questions stop** (Unluminous `task-2279`): a
+        // burst of them is answered from it, and then its 115 MB is given back. See
+        // `passages::let_go_of_the_search_index`.
+        if searched.is_some_and(|at| at.elapsed() >= *SEARCH_INDEX_IDLE) {
+            searched = None;
+            match passages::let_go_of_the_search_index(&store.session()) {
+                Ok(()) => lock(status).search_index_held = false,
+                Err(e) => lock(status).store_error = Some(format!("letting go of the search index: {e}")),
+            }
+        }
         if let Some(job) = first_job.take() {
-            run_a_job(&store, root, status, embedder.as_mut(), job);
+            if matches!(job, StoreJob::Search { .. }) {
+                searched = Some(Instant::now());
+                lock(status).search_index_held = true;
+            }
+            run_a_job(&mut store, root, status, embedder.as_mut(), job);
             continue;
         }
         // **The switch is read on every pass** (Unluminous `task-2279`), so turning embedding off stops it
@@ -561,6 +596,7 @@ fn store_thread(
             Some(_) => match jobs.try_recv() {
                 Ok(job) => job,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    let _ = store.reopen_with(store::BUILD_FRAMES);
                     let panicked = embedder.as_mut().and_then(|e| {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             e.step(&store, status)
@@ -574,6 +610,9 @@ fn store_thread(
                             Some(format!("the embedder panicked: {}", panic_message(&panic)));
                         embedder = None;
                     }
+                    if !embedder.as_ref().is_some_and(|e| e.pending) {
+                        let _ = store.reopen_with(store::cache_frames());
+                    }
                     continue;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
@@ -585,12 +624,22 @@ fn store_thread(
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             },
+            // Woken when the search index is due to be let go of, so it is not held until the next job.
+            None if searched.is_some() => match jobs.recv_timeout(*SEARCH_INDEX_IDLE) {
+                Ok(job) => job,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            },
             None => match jobs.recv() {
                 Ok(job) => job,
                 Err(_) => return,
             },
         };
-        run_a_job(&store, root, status, embedder.as_mut(), job);
+        if matches!(job, StoreJob::Search { .. }) {
+            searched = Some(Instant::now());
+            lock(status).search_index_held = true;
+        }
+        run_a_job(&mut store, root, status, embedder.as_mut(), job);
     }
 }
 
@@ -611,8 +660,9 @@ fn memory_thread(
     jobs: std::sync::mpsc::Receiver<StoreJob>,
 ) {
     let started = Instant::now();
-    let index = Exact::build(root);
+    let mut index = Exact::build(root);
     let table = SymbolTable::build(&index);
+    index.let_go_of_content();
     *exact.write().expect("exact") = Some(index);
     *symbol_table.write().expect("symbols") = Some(table);
     {
@@ -696,7 +746,7 @@ fn open_the_store_again(
 /// @param embedder - the embedder, if there is one
 /// @param job - the job
 fn run_a_job(
-    store: &Store,
+    store: &mut Store,
     root: &Path,
     status: &Mutex<Status>,
     embedder: Option<&mut Embedder>,
@@ -706,14 +756,17 @@ fn run_a_job(
         e.pending = true;
     }
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
+        // A write runs with the pool a build needs, which the passage table's update asks for too.
         StoreJob::Changes { changed, removed, removed_paths, next_id, symbols } => {
-            let records: Vec<&FileRecord> = changed.iter().map(|c| &c.1).collect();
-            store
-                .save_changes(&changed, &removed, next_id)
-                .and_then(|()| store.save_symbol_changes(&symbols, &removed_paths))
-                .and_then(|()| passages::update(&store.session(), &removed_paths, &records))
+            store.with_room(|store| {
+                let records: Vec<&FileRecord> = changed.iter().map(|c| &c.1).collect();
+                store
+                    .save_changes(&changed, &removed, next_id)
+                    .and_then(|()| store.save_symbol_changes(&symbols, &removed_paths))
+                    .and_then(|()| passages::update(&store.session(), &removed_paths, &records))
+            })
         }
-        StoreJob::Full { index } => store.save_exact(&index, root),
+        StoreJob::Full { index } => store.with_room(|store| store.save_exact(&index, root)),
         StoreJob::Search { question, k, kind, reply } => {
             let vectors = lock(status).vectors > 0 && embedding_enabled();
             let _ = reply.send(passages::search(
@@ -777,6 +830,18 @@ pub fn embedding_enabled() -> bool {
 pub fn set_embedding(on: bool) {
     embedding_switch().store(on, std::sync::atomic::Ordering::SeqCst);
 }
+
+/// How long the passage table's search index is kept after the last question: long enough for an agent's
+/// burst of questions to be answered from one build, short enough that an editor does not hold it all day.
+/// `ATRIUS_SEARCH_INDEX_IDLE_SECONDS` changes it.
+static SEARCH_INDEX_IDLE: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+    Duration::from_secs(
+        std::env::var("ATRIUS_SEARCH_INDEX_IDLE_SECONDS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(20),
+    )
+});
 
 /// What `search status` says while embedding is switched off.
 const SWITCHED_OFF: &str = "embedding is switched off";

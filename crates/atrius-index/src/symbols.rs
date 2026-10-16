@@ -14,6 +14,7 @@
 //! of every name, so the cost of a keystroke does not grow with the project.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -29,19 +30,189 @@ pub struct Defined {
     pub definition: Definition,
 }
 
+/// One definition and the file it is in, borrowed from the table: what [`SymbolTable::named`] and
+/// [`SymbolTable::prefixed`] hand out, so a lookup copies nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct DefinedRef<'a> {
+    /// The file's path.
+    pub path: &'a str,
+    /// The definition.
+    pub definition: &'a Definition,
+}
+
+impl DefinedRef<'_> {
+    /// A copy that outlives the table's lock.
+    pub fn to_owned(self) -> Defined {
+        Defined { path: self.path.to_owned(), definition: self.definition.clone() }
+    }
+}
+
+/// Where a definition is kept: its file, shared with every other place in that file, and its index in
+/// the file's list.
+#[derive(Clone, Debug)]
+struct Place {
+    path: Arc<str>,
+    at: u32,
+}
+
 /// Every definition, by lower case name, by file and by container, and every file's imports.
+///
+/// **Each definition is held once** (Unluminous `task-2279`), in `by_file`. The other maps hold where it
+/// is, and a name is one allocation shared by `by_name`, `word_starts` and `humps`. Before, every
+/// definition was cloned into `by_name` with its own copy of its path and every name was copied into
+/// each word it starts, and the table was 62.6 MB for 28,979 definitions whose own text is 10.7 MB.
 #[derive(Default)]
 pub struct SymbolTable {
-    by_name: BTreeMap<String, Vec<Defined>>,
-    by_file: HashMap<String, Vec<Definition>>,
-    /// A container's name and where each of its members is: the file and the index in `by_file`.
-    by_container: HashMap<String, Vec<(String, usize)>>,
+    by_name: BTreeMap<Arc<str>, Vec<Place>>,
+    by_file: HashMap<Arc<str>, Vec<Definition>>,
+    /// A container's name and where each of its members is.
+    by_container: HashMap<Box<str>, Vec<Place>>,
     /// Each lower case name under the part of it that starts at each later word: `layout_scroll` is
     /// under `scroll`, `selectionRectsIn` under `rectsin` and `in`.
-    word_starts: BTreeMap<String, Vec<String>>,
+    word_starts: Listings,
     /// Each lower case name of two or more words under its initials: `layout_scroll_margin` under `lsm`.
-    humps: BTreeMap<String, Vec<String>>,
-    imports: HashMap<String, Vec<crate::structure::Import>>,
+    humps: Listings,
+    imports: HashMap<Arc<str>, Vec<crate::structure::Import>>,
+}
+
+/// A key a name is listed under, held without an allocation of its own wherever it can be.
+#[derive(Clone, Debug)]
+enum Key {
+    /// The lower case name itself from this byte on, which is what a later word's key always is.
+    Tail(u32),
+    /// A short key, held in place: the bytes and how many of them there are.
+    Inline([u8; 22], u8),
+    /// Any other key.
+    Owned(Box<str>),
+}
+
+/// One name under one key.
+#[derive(Clone, Debug)]
+struct Listing {
+    name: Arc<str>,
+    key: Key,
+}
+
+impl Listing {
+    /// The key's text.
+    fn key(&self) -> &str {
+        match &self.key {
+            Key::Tail(at) => self.name.get(*at as usize..).unwrap_or(""),
+            Key::Inline(bytes, len) => std::str::from_utf8(&bytes[..*len as usize]).unwrap_or(""),
+            Key::Owned(text) => text,
+        }
+    }
+}
+
+/// Names under keys, in one list sorted by key (Unluminous `task-2279`).
+///
+/// It replaced two `BTreeMap<String, Vec<String>>`, which made two allocations for every key and one
+/// for every name under it: about 80,000 small allocations on a 2,000 file checkout, each with the
+/// allocator's own header beside it. A key under a later word is the tail of the lower case name, so it
+/// is held as where the tail starts, and an initials key is short enough to hold in place.
+///
+/// The list is sorted once after a whole project is read ([`Listings::settle`]); a name added after that
+/// is put in its place. A list that has not been settled is still answered correctly, by reading all of
+/// it, so nothing depends on a caller remembering to settle it.
+#[derive(Default)]
+struct Listings {
+    entries: Vec<Listing>,
+    sorted: bool,
+}
+
+impl Listings {
+    /// Lists a name under a key.
+    ///
+    /// @param name - the lower case name
+    /// @param key - its key
+    fn add(&mut self, name: &Arc<str>, key: &str) {
+        let lower_before = name.len().saturating_sub(key.len());
+        let key = if name.get(lower_before..) == Some(key) {
+            Key::Tail(lower_before as u32)
+        } else if key.len() <= 22 {
+            let mut bytes = [0u8; 22];
+            bytes[..key.len()].copy_from_slice(key.as_bytes());
+            Key::Inline(bytes, key.len() as u8)
+        } else {
+            Key::Owned(key.into())
+        };
+        let listing = Listing { name: Arc::clone(name), key };
+        if self.sorted {
+            let at = self.entries.partition_point(|e| (e.key(), &*e.name) < (listing.key(), &*listing.name));
+            self.entries.insert(at, listing);
+        } else {
+            self.entries.push(listing);
+        }
+    }
+
+    /// Takes every listing of these names out.
+    ///
+    /// @param names - the lower case names
+    fn remove(&mut self, names: &std::collections::HashSet<&str>) {
+        if !names.is_empty() {
+            self.entries.retain(|e| !names.contains(&*e.name));
+        }
+    }
+
+    /// Sorts the list and gives back the room it was grown into.
+    fn settle(&mut self) {
+        if !self.sorted {
+            self.entries.sort_unstable_by(|a, b| (a.key(), &*a.name).cmp(&(b.key(), &*b.name)));
+            self.sorted = true;
+        }
+        self.entries.shrink_to_fit();
+    }
+
+    /// The names under every key that starts with a prefix.
+    ///
+    /// @param prefix - the prefix, lower case
+    fn starting_with<'a>(&'a self, prefix: &'a str) -> Box<dyn Iterator<Item = &'a str> + 'a> {
+        if !self.sorted {
+            return Box::new(
+                self.entries.iter().filter(move |e| e.key().starts_with(prefix)).map(|e| &*e.name),
+            );
+        }
+        let from = self.entries.partition_point(|e| e.key() < prefix);
+        Box::new(
+            self.entries[from..]
+                .iter()
+                .take_while(move |e| e.key().starts_with(prefix))
+                .map(|e| &*e.name),
+        )
+    }
+}
+
+/// The definitions of one name, borrowed from the table, as [`SymbolTable::named`] answers.
+#[derive(Clone)]
+pub struct Named<'a> {
+    table: &'a SymbolTable,
+    places: std::slice::Iter<'a, Place>,
+}
+
+impl<'a> Iterator for Named<'a> {
+    type Item = DefinedRef<'a>;
+
+    fn next(&mut self) -> Option<DefinedRef<'a>> {
+        for place in self.places.by_ref() {
+            if let Some(found) = self.table.place(place) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.places.size_hint()
+    }
+}
+
+impl ExactSizeIterator for Named<'_> {}
+
+impl Named<'_> {
+    /// Whether the name has no definitions.
+    pub fn is_empty(&self) -> bool {
+        self.places.len() == 0
+    }
 }
 
 /// Where each word of a name starts, as character indices: the start, after a character that is not a
@@ -137,6 +308,7 @@ impl SymbolTable {
         for (path, read) in read {
             table.set_file_with_imports(&path, read.definitions, read.imports);
         }
+        table.shrink();
         table
     }
 
@@ -160,31 +332,41 @@ impl SymbolTable {
         imports: Vec<crate::structure::Import>,
     ) {
         self.remove_file(path);
+        let shared: Arc<str> = Arc::from(path);
         for (at, d) in defs.iter().enumerate() {
-            let key = d.name.to_lowercase();
-            let fresh = !self.by_name.contains_key(&key);
-            self.by_name
-                .entry(key.clone())
-                .or_default()
-                .push(Defined { path: path.to_owned(), definition: d.clone() });
-            if fresh {
-                let (later, initials) = search_keys(&d.name);
-                for part in later {
-                    self.word_starts.entry(part).or_default().push(key.clone());
-                }
-                if let Some(initials) = initials {
-                    self.humps.entry(initials).or_default().push(key.clone());
+            let place = Place { path: Arc::clone(&shared), at: at as u32 };
+            let lower = d.name.to_lowercase();
+            match self.by_name.get_mut(lower.as_str()) {
+                Some(places) => places.push(place),
+                None => {
+                    let key: Arc<str> = Arc::from(lower);
+                    let (later, initials) = search_keys(&d.name);
+                    for part in later {
+                        self.word_starts.add(&key, &part);
+                    }
+                    if let Some(initials) = initials {
+                        self.humps.add(&key, &initials);
+                    }
+                    self.by_name.insert(key, vec![place]);
                 }
             }
             if let Some(container) = &d.container {
-                self.by_container.entry(container.clone()).or_default().push((path.to_owned(), at));
+                let place = Place { path: Arc::clone(&shared), at: at as u32 };
+                match self.by_container.get_mut(container.as_str()) {
+                    Some(places) => places.push(place),
+                    None => {
+                        self.by_container.insert(container.as_str().into(), vec![place]);
+                    }
+                }
             }
         }
         if !defs.is_empty() {
-            self.by_file.insert(path.to_owned(), defs);
+            let mut defs = defs;
+            defs.shrink_to_fit();
+            self.by_file.insert(Arc::clone(&shared), defs);
         }
         if !imports.is_empty() {
-            self.imports.insert(path.to_owned(), imports);
+            self.imports.insert(shared, imports);
         }
     }
 
@@ -194,34 +376,28 @@ impl SymbolTable {
     pub fn remove_file(&mut self, path: &str) {
         self.imports.remove(path);
         let Some(old) = self.by_file.remove(path) else { return };
+        let mut gone: Vec<String> = Vec::new();
         for d in old {
             if let Some(container) = &d.container {
-                if let Some(list) = self.by_container.get_mut(container) {
-                    list.retain(|(p, _)| p != path);
+                if let Some(list) = self.by_container.get_mut(container.as_str()) {
+                    list.retain(|p| &*p.path != path);
                     if list.is_empty() {
-                        self.by_container.remove(container);
+                        self.by_container.remove(container.as_str());
                     }
                 }
             }
             let key = d.name.to_lowercase();
-            let Some(list) = self.by_name.get_mut(&key) else { continue };
-            list.retain(|x| x.path != path);
+            let Some(list) = self.by_name.get_mut(key.as_str()) else { continue };
+            list.retain(|x| &*x.path != path);
             if !list.is_empty() {
                 continue;
             }
-            self.by_name.remove(&key);
-            let (later, initials) = search_keys(&d.name);
-            for part in later.into_iter().chain(initials) {
-                for map in [&mut self.word_starts, &mut self.humps] {
-                    if let Some(names) = map.get_mut(&part) {
-                        names.retain(|n| n != &key);
-                        if names.is_empty() {
-                            map.remove(&part);
-                        }
-                    }
-                }
-            }
+            self.by_name.remove(key.as_str());
+            gone.push(key);
         }
+        let gone: std::collections::HashSet<&str> = gone.iter().map(String::as_str).collect();
+        self.word_starts.remove(&gone);
+        self.humps.remove(&gone);
     }
 
     /// The members of a container: every definition whose block is the container's, from every file
@@ -236,14 +412,38 @@ impl SymbolTable {
             .get(container)
             .into_iter()
             .flatten()
-            .filter_map(|(path, at)| Some((path.as_str(), self.by_file.get(path)?.get(*at)?)))
+            .filter_map(|place| self.place(place).map(|found| (found.path, found.definition)))
+    }
+
+    /// The definition a place names, if its file still holds it.
+    ///
+    /// @param place - the place
+    fn place(&self, place: &Place) -> Option<DefinedRef<'_>> {
+        let (path, defs) = self.by_file.get_key_value(&*place.path)?;
+        Some(DefinedRef { path, definition: defs.get(place.at as usize)? })
+    }
+
+    /// Gives back the room the maps were grown into, once a whole project has been read.
+    pub fn shrink(&mut self) {
+        for places in self.by_name.values_mut() {
+            places.shrink_to_fit();
+        }
+        for places in self.by_container.values_mut() {
+            places.shrink_to_fit();
+        }
+        self.word_starts.settle();
+        self.humps.settle();
+        self.by_file.shrink_to_fit();
+        self.by_container.shrink_to_fit();
+        self.imports.shrink_to_fit();
     }
 
     /// The definitions of a lower case name, exactly.
     ///
     /// @param lower - the name, lower case
-    pub fn named(&self, lower: &str) -> &[Defined] {
-        self.by_name.get(lower).map_or(&[], Vec::as_slice)
+    pub fn named(&self, lower: &str) -> Named<'_> {
+        let places = self.by_name.get(lower).map_or(&[][..], Vec::as_slice);
+        Named { table: self, places: places.iter() }
     }
 
     /// The lower case names that start with a lower case prefix, in order, each with its definitions.
@@ -252,12 +452,12 @@ impl SymbolTable {
     pub fn prefixed<'a>(
         &'a self,
         prefix: &'a str,
-    ) -> impl Iterator<Item = (&'a str, &'a [Defined])> + 'a {
+    ) -> impl Iterator<Item = (&'a str, Named<'a>)> + 'a {
         let from = (std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded);
         self.by_name
             .range::<str, _>(from)
             .take_while(move |(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .map(move |(k, v)| (&**k, Named { table: self, places: v.iter() }))
     }
 
     /// The lower case names with a later word that starts with a lower case prefix: `scroll` reaches
@@ -265,7 +465,7 @@ impl SymbolTable {
     ///
     /// @param prefix - the prefix, lower case
     pub fn word_started<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-        ranged(&self.word_starts, prefix)
+        self.word_starts.starting_with(prefix)
     }
 
     /// The lower case names whose initials start with a lower case prefix: `lsm` reaches
@@ -273,7 +473,7 @@ impl SymbolTable {
     ///
     /// @param prefix - the prefix, lower case
     pub fn humped<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-        ranged(&self.humps, prefix)
+        self.humps.starting_with(prefix)
     }
 
     /// A file's imports, in the order they are written.
@@ -285,25 +485,25 @@ impl SymbolTable {
 
     /// Every file that defines something, with its definitions.
     pub fn files(&self) -> impl Iterator<Item = (&str, &[Definition])> {
-        self.by_file.iter().map(|(p, d)| (p.as_str(), d.as_slice()))
+        self.by_file.iter().map(|(p, d)| (&**p, d.as_slice()))
     }
 
     /// Every file's imports.
     pub fn all_imports(&self) -> impl Iterator<Item = (&str, &[crate::structure::Import])> {
-        self.imports.iter().map(|(p, i)| (p.as_str(), i.as_slice()))
+        self.imports.iter().map(|(p, i)| (&**p, i.as_slice()))
     }
 
     /// A copy of every file's definitions and imports, for the store to write with no lock held.
     #[allow(clippy::type_complexity)]
     pub fn rows(&self) -> Vec<(String, Vec<Definition>, Vec<crate::structure::Import>)> {
-        let mut paths: Vec<&String> = self.by_file.keys().chain(self.imports.keys()).collect();
+        let mut paths: Vec<&Arc<str>> = self.by_file.keys().chain(self.imports.keys()).collect();
         paths.sort();
         paths.dedup();
         paths
             .into_iter()
             .map(|p| {
                 let defs = self.by_file.get(p).cloned().unwrap_or_default();
-                (p.clone(), defs, self.imports.get(p).cloned().unwrap_or_default())
+                (p.to_string(), defs, self.imports.get(p).cloned().unwrap_or_default())
             })
             .collect()
     }
@@ -332,16 +532,16 @@ impl SymbolTable {
     /// @param limit - how many to return
     pub fn lookup(&self, name: &str, limit: usize) -> Vec<Defined> {
         let lower = name.to_lowercase();
-        let mut found: Vec<Defined> = self.by_name.get(&lower).cloned().unwrap_or_default();
+        let mut found: Vec<Defined> = self.named(&lower).map(DefinedRef::to_owned).collect();
         if found.is_empty() && lower.len() >= 3 {
-            let mut partial: Vec<&Defined> = self
+            let mut partial: Vec<DefinedRef<'_>> = self
                 .by_name
                 .iter()
-                .filter(|(k, _)| k.contains(&lower))
-                .flat_map(|(_, v)| v.iter())
+                .filter(|(k, _)| k.contains(lower.as_str()))
+                .flat_map(|(_, v)| v.iter().filter_map(|place| self.place(place)))
                 .collect();
             partial.sort_by_key(|d| d.definition.name.len());
-            found = partial.into_iter().take(limit * 4).cloned().collect();
+            found = partial.into_iter().take(limit * 4).map(DefinedRef::to_owned).collect();
         }
         found.sort_by_key(|d| rank(d, name));
         found.truncate(limit);
@@ -369,20 +569,6 @@ fn rank(d: &Defined, asked: &str) -> (u8, u8, u8, u8, u8, usize, u32) {
         d.path.matches('/').count(),
         def.depth,
     )
-}
-
-/// The lower case names under every key of a map that starts with a prefix.
-///
-/// @param map - `word_starts` or `humps`
-/// @param prefix - the prefix, lower case
-fn ranged<'a>(
-    map: &'a BTreeMap<String, Vec<String>>,
-    prefix: &'a str,
-) -> impl Iterator<Item = &'a str> + 'a {
-    let from = (std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded);
-    map.range::<str, _>(from)
-        .take_while(move |(k, _)| k.starts_with(prefix))
-        .flat_map(|(_, names)| names.iter().map(String::as_str))
 }
 
 /// One file's listed definitions and its imports.

@@ -132,3 +132,40 @@ fn a_file_that_changes_keeps_one_blob_and_a_removed_file_keeps_none() {
     store.save_changes(&[], &[gone], exact.files.len()).unwrap();
     assert_eq!(rows_in(&store, "blob"), 2, "a removed file's content goes with it");
 }
+
+/// Unluminous `task-2279`: a plain English question builds the passage table's search index in memory,
+/// 115 MB on a 2,000 file checkout, and the module kept it for the life of the process. It is let go of
+/// once the questions stop, and the next question builds it again.
+#[test]
+fn the_search_index_a_question_built_is_let_go_of_once_the_questions_stop() {
+    scratch_cache();
+    std::env::set_var("ATRIUS_SEARCH_INDEX_IDLE_SECONDS", "1");
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    a_project(&root);
+    let root = atrius_index::host::canonical(&root);
+    let index = Index::open_quietly(&root);
+    assert!(index.wait_ready(Duration::from_secs(60)), "the index is ready");
+    let began = Instant::now();
+    while !index.status().passages_ready && began.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let asked = atrius_index::verbs::answer(&index, "find", &find("how is a request handled", "semantic"))
+        .expect("a question is answered");
+    assert!(asked["text"].as_str().unwrap().contains("src/handler.rs"), "{asked}");
+    assert!(index.status().search_index_held, "the index the question built is held");
+
+    let began = Instant::now();
+    // Up to the default idle time and more, because another test in this process may have read the
+    // setting first.
+    while index.status().search_index_held && began.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!index.status().search_index_held, "and let go of once the questions stop");
+    assert_eq!(index.status().store_error, None);
+
+    let again = atrius_index::verbs::answer(&index, "find", &find("how is a request handled", "semantic"))
+        .expect("the next question is answered");
+    assert!(again["text"].as_str().unwrap().contains("src/handler.rs"), "{again}");
+}

@@ -586,6 +586,7 @@ fn status(index: &Index) -> Value {
         "vectors": st.vectors,
         "canEmbed": st.can_embed,
         "notEmbedding": st.not_embedding,
+        "searchIndexHeld": st.search_index_held,
         "storeError": st.store_error,
         "indexFile": st.file.to_string_lossy(),
         "versions": { "schema": crate::store::SCHEMA_VERSION, "trigram": crate::store::TRIGRAM_VERSION },
@@ -882,7 +883,7 @@ fn file_text(index: &Index, rel: &str) -> Option<String> {
                 .by_path
                 .get(rel)
                 .and_then(|&id| exact.files[id as usize].as_ref())
-                .filter(|r| !r.is_partial())
+                .filter(|r| !r.is_partial() && r.is_held())
                 .map(|r| r.bytes())
         })
         .flatten();

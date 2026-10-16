@@ -62,8 +62,11 @@ CREATE INDEX IF NOT EXISTS import_path ON import(path);
 
 /// The index file of one checkout.
 pub struct Store {
-    database: Database,
+    /// None only for the moment between closing the file and opening it again with another pool.
+    database: Option<Database>,
     path: PathBuf,
+    /// How many pages the file's pool was opened with.
+    frames: usize,
 }
 
 /// Where the index of a root lives: `<cache>/atrius-index/index/<blake3 of the canonical root>/index.rdb`.
@@ -101,20 +104,69 @@ pub fn cache_folder() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// How many 32 KiB pages the index file's buffer pool holds: 1,024, which is 32 MiB, or
-/// `ATRIUS_STORE_CACHE_FRAMES`.
+/// Opens the index file with a pool of this many pages.
+///
+/// @param path - the file
+/// @param frames - how many 32 KiB pages
+fn open_database(path: &Path, frames: usize) -> Result<Database, String> {
+    let options = OpenOptions { create: true, cache_frames: frames, ..OpenOptions::default() };
+    Database::open_with(path, options).map_err(|e| e.to_string())
+}
+
+/// The pool a store opens with and builds with: 1,024 pages, 32 MiB, which is what building the passage
+/// table needs (see [`Store::reopen_with`]).
+pub const BUILD_FRAMES: usize = 1024;
+
+/// How many rows one page of a load reads.
+const LOAD_PAGE: usize = 1024;
+
+/// Runs a query a page of rows at a time and hands each row over, so a load never holds the whole of a
+/// table's result beside what is built from it (Unluminous `task-2279`: a window that loaded its index
+/// peaked 25 MB above what it kept, and the Windows heap keeps a peak's pages). The query names its key
+/// first and filters `> ?1` on it in key order.
+///
+/// @param session - the connection
+/// @param sql - `SELECT key, ... WHERE key > ?1 ORDER BY key`
+/// @param each - what to do with a row
+fn in_pages(
+    session: &inillucent_driver::Connection<'_>,
+    sql: &str,
+    mut each: impl FnMut(&[Value]),
+) -> Result<(), String> {
+    let mut after = i64::MIN;
+    loop {
+        let rows = session
+            .query(sql, &[Value::Integer(after)], LOAD_PAGE)
+            .map_err(|e| e.to_string())?;
+        for row in &rows.rows {
+            if let Some(Value::Integer(key)) = row.first() {
+                after = *key;
+            }
+            each(row);
+        }
+        if rows.rows.len() < LOAD_PAGE {
+            return Ok(());
+        }
+    }
+}
+
+/// How many 32 KiB pages the index file's buffer pool holds once the index is loaded or built: 128,
+/// which is 4 MiB, or `ATRIUS_STORE_CACHE_FRAMES`. A build, a batch of changes and a compaction reopen
+/// the file with [`BUILD_FRAMES`] for as long as they take.
 ///
 /// Inillucent's default is 4,096, 128 MiB, which is right for a database that answers queries from its
 /// pages. This one is read whole once when a host opens it, into the exact index and the symbol table held
 /// in memory, and after that it is written a batch at a time and asked a passage search now and then. The
 /// pool filled to its 128 MiB during that one read and kept it for the life of the host, which in an
-/// editor that hosts its project's index is the editor's whole life (Unluminous `task-2279`).
+/// editor that hosts its project's index is the editor's whole life (Unluminous `task-2279`). 32 MiB in
+/// 0.2.2 and 4 MiB since 0.3.0, measured 33 MB less in a window: the pages a passage search or a batch of
+/// changes reads are in the operating system's file cache whatever the pool holds.
 pub fn cache_frames() -> usize {
     std::env::var("ATRIUS_STORE_CACHE_FRAMES")
         .ok()
         .and_then(|n| n.trim().parse().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(1024)
+        .unwrap_or(128)
 }
 
 impl Store {
@@ -125,11 +177,51 @@ impl Store {
         std::fs::create_dir_all(folder)
             .map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
         let path = folder.join("index.rdb");
-        let options =
-            OpenOptions { create: true, cache_frames: cache_frames(), ..OpenOptions::default() };
-        let database = Database::open_with(&path, options).map_err(|e| e.to_string())?;
+        let database = open_database(&path, BUILD_FRAMES)?;
         database.session().execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-        Ok(Store { database, path })
+        Ok(Store { database: Some(database), path, frames: BUILD_FRAMES })
+    }
+
+    /// Opens the file again with another pool size. The file is closed first, because one process holds
+    /// it once; when it cannot be opened again with the size asked for, it is opened as it was.
+    ///
+    /// The pool has to be large while the passage table is built or written: Inillucent 2.0 pins pages
+    /// while it builds a search table, and with 512 pages or fewer the build failed with "out of memory",
+    /// so the passages were never written and every open built them again (Unluminous `task-2279`). It
+    /// only has to be small the rest of the time, which is nearly all of it.
+    ///
+    /// @param frames - how many 32 KiB pages
+    pub fn reopen_with(&mut self, frames: usize) -> Result<(), String> {
+        if self.frames == frames && self.database.is_some() {
+            return Ok(());
+        }
+        drop(self.database.take());
+        match open_database(&self.path, frames) {
+            Ok(database) => {
+                self.database = Some(database);
+                self.frames = frames;
+                Ok(())
+            }
+            Err(e) => {
+                self.database = Some(open_database(&self.path, self.frames)?);
+                Err(e)
+            }
+        }
+    }
+
+    /// Opens the file with room to build, runs the work, and goes back to the small pool.
+    ///
+    /// @param work - what to do
+    pub fn with_room<T>(&mut self, work: impl FnOnce(&Store) -> T) -> T {
+        let _ = self.reopen_with(BUILD_FRAMES);
+        let done = work(self);
+        let _ = self.reopen_with(cache_frames());
+        done
+    }
+
+    /// How many pages the file's pool holds now.
+    pub fn frames(&self) -> usize {
+        self.frames
     }
 
     /// Opens the index file in a folder, first deleting it when an older schema wrote it, so a rebuild
@@ -161,7 +253,7 @@ impl Store {
 
     /// A connection for one unit of work.
     pub fn session(&self) -> Connection<'_> {
-        self.database.session()
+        self.database.as_ref().expect("the index file is open").session()
     }
 
     /// One value of `meta`.
@@ -210,9 +302,19 @@ impl Store {
             let Some(record) = record else { continue };
             write_file_row(&tx, id as u32, record)?;
             if blobs.insert(record.hash) {
+                // A record that let go of its content is written from the file it came from.
+                let read;
+                let blocks = match record.is_held() {
+                    true => &record.blocks,
+                    false => {
+                        let bytes = record.content(Some(root)).unwrap_or_default();
+                        read = FileRecord::from_bytes(record.rel.clone(), record.mtime_ns, &bytes).0;
+                        &read.blocks
+                    }
+                };
                 tx.execute(
                     "INSERT INTO blob (content_hash, bytes) VALUES (?1, ?2)",
-                    &[Value::Blob(record.hash.to_vec()), Value::Blob(pack_blocks(&record.blocks))],
+                    &[Value::Blob(record.hash.to_vec()), Value::Blob(pack_blocks(blocks))],
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -315,16 +417,13 @@ impl Store {
         let session = self.session();
         let next_id: usize = self.meta("next_id").and_then(|v| v.parse().ok()).unwrap_or(0);
         let mut postings = Postings::default();
-        let base = session
-            .query_all("SELECT tri, postings FROM trigram", &[])
-            .map_err(|e| e.to_string())?;
-        for row in &base.rows {
+        in_pages(&session, "SELECT tri, postings FROM trigram WHERE tri > ?1 ORDER BY tri", |row| {
             if let (Some(Value::Integer(tri)), Some(bytes)) =
                 (row.first(), row.get(1).and_then(Value::bytes))
             {
                 postings.insert(*tri as u32, Posting::from_bytes(bytes.to_vec()));
             }
-        }
+        })?;
         let deltas = session
             .query_all(
                 "SELECT file_id, tris FROM trigram_delta WHERE tombstone = 0 ORDER BY file_id",
@@ -340,11 +439,8 @@ impl Store {
                 }
             }
         }
-        let rows = session
-            .query_all("SELECT f.id, f.path, f.size, f.mtime_ns, f.content_hash, f.is_binary, f.line_count, b.bytes FROM file f JOIN blob b ON b.content_hash = f.content_hash", &[])
-            .map_err(|e| e.to_string())?;
         let mut files: Vec<Option<FileRecord>> = vec![None; next_id];
-        for row in &rows.rows {
+        in_pages(&session, "SELECT f.id, f.path, f.size, f.mtime_ns, f.content_hash, f.is_binary, f.line_count, b.bytes FROM file f JOIN blob b ON b.content_hash = f.content_hash WHERE f.id > ?1 ORDER BY f.id", |row| {
             let int = |i: usize| match row.get(i) {
                 Some(Value::Integer(v)) => *v,
                 _ => 0,
@@ -367,7 +463,7 @@ impl Store {
                 lines: int(6) as u32,
             }
             .held_to_its_first_nul());
-        }
+        })?;
         Ok(Exact::restore(files, postings))
     }
 }
@@ -429,18 +525,20 @@ impl Store {
             return Ok(None);
         }
         let session = self.session();
-        let rows = session
-            .query_all("SELECT path, name, kind, container, signature, parameters, returns, type_text, visibility, doc, line, end_line, start_line, byte_start, byte_end, likely, depth, exported, member FROM symbol ORDER BY path, ordinal", &[])
-            .map_err(|e| e.to_string())?;
+        // In the order the rows were written, which keeps each file's rows together and in ordinal order:
+        // `save_symbols` writes the files one after another and `save_symbol_changes` deletes a file's rows
+        // before it writes them again. Paged by id, so the whole table is never in memory twice.
         let mut by_file: Vec<(String, Vec<Definition>)> = Vec::new();
-        for row in &rows.rows {
+        in_pages(&session, "SELECT id, path, name, kind, container, signature, parameters, returns, type_text, visibility, doc, line, end_line, start_line, byte_start, byte_end, likely, depth, exported, member FROM symbol WHERE id > ?1 ORDER BY id", |row| {
+            let row = &row[1..];
             let path = text_at(row, 0).unwrap_or_default();
             let definition = definition_from_row(row);
             match by_file.last_mut() {
                 Some((last, defs)) if *last == path => defs.push(definition),
                 _ => by_file.push((path, vec![definition])),
             }
-        }
+        })?;
+        by_file.sort_by(|a, b| a.0.cmp(&b.0));
         let mut imports: HashMap<String, Vec<Import>> = HashMap::new();
         let rows = session
             .query_all("SELECT path, segments, alias, is_glob, byte_start, byte_end FROM import ORDER BY path, ordinal", &[])
@@ -463,6 +561,7 @@ impl Store {
         for (path, own) in imports {
             table.set_file_with_imports(&path, Vec::new(), own);
         }
+        table.shrink();
         Ok(Some(table))
     }
 }

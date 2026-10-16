@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.3.0
+
+A loaded index holds about a third of the memory it did. Measured on the Unluminous checkout (2,000
+files) in a probe that opens the index and waits: private memory went from 140 MB to 51 MB, the live heap
+from 116 MB to 31 MB, and the number of live allocations from 393,000 to 250,000. Search results are
+unchanged, and the parity test against ripgrep now runs every search a second time after the index has
+let go of the file contents.
+
+- **Breaking:** `SymbolTable::named` returns an iterator of `DefinedRef`, which borrows the path and the
+  definition, where it returned a `Vec<Defined>`. `DefinedRef::to_owned` gives the old value. Each path
+  is held once, as an `Arc<str>` shared by every place that names it, where every place held its own
+  `String`.
+- File contents are no longer held in memory once the index is built. A search verifies a candidate
+  block by reading it from the disk, which is what ripgrep does for every block. On this checkout an
+  exact name is still found in under a millisecond and the pattern `fn ` in 20 to 26 ms.
+  `atrius_index::exact::set_holding_content(true)` or `ATRIUS_HOLD_CONTENT=on` keeps them, for a host
+  that is asked many questions a second.
+- The buffer pool of the index file is 128 pages of 32 KiB once the index is built, where it was 1,024.
+  Building the passage table needs about 1,024 pages, and fails with `out of memory [syntax]` with 512 or
+  fewer, so a host opens the file with 1,024 pages while it builds or writes a change and reopens it with
+  the small pool afterwards. `ATRIUS_STORE_CACHE_FRAMES` still sets the number used at rest.
+  `tests/pool.rs` builds an index that fails with 128 pages and checks that it builds and loads.
+- The search index Inillucent builds for a plain English question is let go of 20 seconds after the last
+  question (`ATRIUS_SEARCH_INDEX_IDLE_SECONDS`). It was 115 MB on this checkout and was held until the
+  next change to a file. `search status` says whether it is held, as `searchIndexHeld`.
+- The trigram postings and the symbol listings are kept in smaller forms: a posting list of up to 14
+  bytes is stored inline, and the word and capital letter listings are sorted vectors with short keys
+  stored inline, where they were maps of owned strings.
+- The index file, the trigrams and the symbols are read in pages of 1,024 rows, so loading an index no
+  longer holds every row of a table in memory at once.
+- Embedding: switching it on while an index is still being set up could be lost, because the host read
+  the switch before it had read its own status. The host now starts from the status.
+
 ## 0.2.2
 
 - Embedding can be switched on and off while an index runs, with `atrius_index::index::set_embedding`.

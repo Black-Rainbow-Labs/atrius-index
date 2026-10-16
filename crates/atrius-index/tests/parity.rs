@@ -110,7 +110,14 @@ fn every_fixture_search_gives_ripgreps_lines() {
     };
     let dir = tempfile::tempdir().expect("a folder");
     fixture(dir.path());
-    let index = Exact::build(dir.path());
+    let held = Exact::build(dir.path());
+    // The same index with its content let go of, as an editor that hosts it runs it (Unluminous
+    // `task-2279`): every candidate is read from the disk, and the lines must be ripgrep's all the same.
+    atrius_index::exact::set_holding_content(false);
+    let mut on_disk = held.clone();
+    on_disk.let_go_of_content();
+    atrius_index::exact::set_holding_content(true);
+    assert!(on_disk.files.iter().flatten().all(|r| !r.is_held() || r.size == 0), "nothing is held");
     let cases: &[(&str, bool, &str)] = &[
         ("Hello", false, "."),
         ("hello", true, "."),
@@ -130,19 +137,22 @@ fn every_fixture_search_gives_ripgreps_lines() {
         ("x{0}", false, "src"),
     ];
     let mut differences = Vec::new();
-    for &(pattern, insensitive, path) in cases {
-        let scope = Scope::new(dir.path(), path, &[], &[]).expect("a scope");
-        let request = ExactRequest { pattern, case_insensitive: insensitive, scope: &scope };
-        let ours: BTreeSet<String> = index
-            .search(dir.path(), &request)
-            .expect("searched")
-            .hits
-            .iter()
-            .map(|h| format!("{}:{}", h.path, h.line))
-            .collect();
-        let theirs = rg_set(&rg, dir.path(), pattern, insensitive, path);
-        if ours != theirs {
-            differences.push(format!("{pattern:?} in {path}: index {ours:?}, rg {theirs:?}"));
+    for (index, how) in [(&held, "held"), (&on_disk, "read from the disk")] {
+        for &(pattern, insensitive, path) in cases {
+            let scope = Scope::new(dir.path(), path, &[], &[]).expect("a scope");
+            let request = ExactRequest { pattern, case_insensitive: insensitive, scope: &scope };
+            let ours: BTreeSet<String> = index
+                .search(dir.path(), &request)
+                .expect("searched")
+                .hits
+                .iter()
+                .map(|h| format!("{}:{}", h.path, h.line))
+                .collect();
+            let theirs = rg_set(&rg, dir.path(), pattern, insensitive, path);
+            if ours != theirs {
+                differences
+                    .push(format!("{how}: {pattern:?} in {path}: index {ours:?}, rg {theirs:?}"));
+            }
         }
     }
     assert!(differences.is_empty(), "{}", differences.join("\n"));

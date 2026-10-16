@@ -87,13 +87,7 @@ impl FileRecord {
                 first_line,
                 packed: lz4_flex::block::compress_prepend_size(&bytes[start..end]),
             });
-            trigrams.push(if decoded {
-                trigrams_of(&searched)
-            } else if whole {
-                trigrams_of(&bytes[start..end])
-            } else {
-                trigrams_of(&bytes[start..end])
-            });
+            trigrams.push(if decoded { trigrams_of(&searched) } else { trigrams_of(&bytes[start..end]) });
         }
         let record = FileRecord {
             rel,
@@ -131,15 +125,55 @@ impl FileRecord {
         self
     }
 
-    /// How many of the file's bytes the record holds, read from the length each block carries.
+    /// How many of the file's bytes the record covers, read from the length each block carries.
     fn held_len(&self) -> u64 {
-        self.blocks
-            .iter()
-            .map(|block| {
-                block.packed.get(..4).map_or(0, |n| u32::from_le_bytes([n[0], n[1], n[2], n[3]]))
-                    as u64
-            })
-            .sum()
+        self.blocks.iter().map(|block| u64::from(block.len())).sum()
+    }
+
+    /// Whether the record holds its content in memory. See [`set_holding_content`].
+    pub fn is_held(&self) -> bool {
+        self.blocks.iter().all(Block::is_held)
+    }
+
+    /// Lets go of the content, keeping each block's first line and length.
+    pub fn let_go_of_content(&mut self) {
+        for block in &mut self.blocks {
+            block.let_go();
+        }
+    }
+
+    /// The bytes the record covers: from memory when it holds them, and otherwise from the file, cut at
+    /// its first NUL as [`FileRecord::from_bytes`] cut it. None when the file cannot be read.
+    ///
+    /// @param root - the root the record's path is under
+    pub fn content(&self, root: Option<&Path>) -> Option<Vec<u8>> {
+        if self.is_held() {
+            return Some(self.bytes());
+        }
+        let mut bytes = std::fs::read(root?.join(&self.rel)).ok()?;
+        if self.binary && matches!(searched_text(&bytes), std::borrow::Cow::Borrowed(_)) {
+            if let Some(at) = memchr::memchr(0, &bytes) {
+                bytes.truncate(at + 1);
+            }
+        }
+        Some(bytes)
+    }
+
+    /// One block's bytes: from memory when the record holds them, and otherwise the same span of the file
+    /// as it is now, worked out by the rule the record was made with.
+    ///
+    /// @param block - the block
+    /// @param root - the root the record's path is under
+    pub fn block_bytes(&self, block: usize, root: Option<&Path>) -> Vec<u8> {
+        if let Some(piece) = self.blocks.get(block).filter(|piece| piece.is_held()) {
+            return piece.bytes();
+        }
+        let Some(bytes) = self.content(root) else { return Vec::new() };
+        let whole = self.binary || matches!(searched_text(&bytes), std::borrow::Cow::Owned(_));
+        if whole {
+            return if block == 0 { bytes } else { Vec::new() };
+        }
+        block_spans(&bytes).get(block).map_or_else(Vec::new, |&(start, end, _)| bytes[start..end].to_vec())
     }
 
     /// The bytes the record holds: the whole file, or for a partial record the part up to its first NUL.
@@ -159,6 +193,39 @@ impl FileRecord {
     }
 }
 
+/// Whether the index holds every file's content in memory. Read from `ATRIUS_HOLD_CONTENT` the first time
+/// it is asked, on unless that says `off`, and changed by [`set_holding_content`].
+static HOLDING: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+
+/// The switch, made from `ATRIUS_HOLD_CONTENT` the first time.
+fn holding_switch() -> &'static std::sync::atomic::AtomicBool {
+    HOLDING.get_or_init(|| {
+        let off = std::env::var("ATRIUS_HOLD_CONTENT")
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
+        std::sync::atomic::AtomicBool::new(!off)
+    })
+}
+
+/// Whether the index holds file content in memory: on unless [`set_holding_content`] or
+/// `ATRIUS_HOLD_CONTENT=off` said otherwise.
+pub fn holding_content() -> bool {
+    holding_switch().load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether an index keeps every file's content in memory, for the whole process.
+///
+/// On, which is how Atrius has always worked, a search verifies its candidates without touching the disk.
+/// Off, a record keeps only its blocks' first lines and lengths once the store has written it and its
+/// definitions and passages have been read, and a search reads each candidate file from the disk, the way
+/// ripgrep reads every file. The answers are the same, because the gate that runs before every search has
+/// already brought the index up to date with the files. An editor that hosts its project's index sets it
+/// off (Unluminous `task-2279`, where the content was 11.4 MB of a 2,000 file checkout's index).
+///
+/// @param on - whether to hold content
+pub fn set_holding_content(on: bool) {
+    holding_switch().store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// One block of a file: the line it starts on and its bytes, compressed.
 #[derive(Clone, Debug)]
 pub struct Block {
@@ -169,9 +236,33 @@ pub struct Block {
 }
 
 impl Block {
-    /// The block's bytes.
+    /// The block's bytes, or nothing when it does not hold them.
     pub fn bytes(&self) -> Vec<u8> {
         lz4_flex::block::decompress_size_prepended(&self.packed).unwrap_or_default()
+    }
+
+    /// How many bytes the block covers, from the length its packed form starts with.
+    pub fn len(&self) -> u32 {
+        self.packed.get(..4).map_or(0, |n| u32::from_le_bytes([n[0], n[1], n[2], n[3]]))
+    }
+
+    /// Whether the block covers nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether the block holds its bytes. A block that let go of them keeps only the four bytes of its
+    /// length, and compressed bytes of anything at all are longer than that.
+    pub fn is_held(&self) -> bool {
+        self.packed.len() != 4 || self.is_empty()
+    }
+
+    /// Keeps the length and lets go of the bytes.
+    fn let_go(&mut self) {
+        if self.is_held() && !self.is_empty() {
+            self.packed.truncate(4);
+            self.packed.shrink_to_fit();
+        }
     }
 }
 
@@ -314,6 +405,8 @@ pub struct Exact {
     /// Counts every insert and removal, so a copy taken for compaction can tell whether the index it
     /// was taken from changed while it was being rebuilt.
     pub generation: u64,
+    /// The root, which a record that let go of its content is read from.
+    pub root: Option<std::path::PathBuf>,
 }
 
 impl Exact {
@@ -325,7 +418,7 @@ impl Exact {
         let found = files::walk(root);
         let read: Vec<Option<(FileRecord, Vec<Vec<u32>>)>> =
             found.par_iter().map(|f| FileRecord::read(root, f)).collect();
-        let mut exact = Exact::default();
+        let mut exact = Exact { root: Some(root.to_path_buf()), ..Exact::default() };
         for (record, trigrams) in read.into_iter().flatten() {
             exact.insert(record, &trigrams);
         }
@@ -336,23 +429,53 @@ impl Exact {
     /// Each file's trigrams are taken again from its bytes, in parallel.
     ///
     /// @param records - the live files
-    pub fn from_records(records: Vec<FileRecord>) -> Exact {
+    /// @param root - the root, which a record that let go of its content is read from
+    pub fn from_records(records: Vec<FileRecord>, root: Option<&Path>) -> Exact {
         let read: Vec<(FileRecord, Vec<Vec<u32>>)> = records
             .into_par_iter()
-            .map(|r| match r.is_partial() {
+            .filter_map(|r| match (r.is_held(), r.is_partial()) {
                 // Taken from its bytes again, a partial record would be a whole one of a shorter file.
-                true => {
+                (true, true) => {
                     let trigrams = vec![trigrams_of(&r.bytes())];
-                    (r, trigrams)
+                    Some((r, trigrams))
                 }
-                false => FileRecord::from_bytes(r.rel.clone(), r.mtime_ns, &r.bytes()),
+                (true, false) => Some(FileRecord::from_bytes(r.rel.clone(), r.mtime_ns, &r.bytes())),
+                // A record that let go of its content is read again from the file.
+                (false, _) => {
+                    let bytes = std::fs::read(root?.join(&r.rel)).ok()?;
+                    Some(FileRecord::from_bytes(r.rel.clone(), r.mtime_ns, &bytes))
+                }
             })
             .collect();
-        let mut exact = Exact::default();
+        let mut exact = Exact { root: root.map(Path::to_path_buf), ..Exact::default() };
         for (record, trigrams) in read {
             exact.insert(record, &trigrams);
         }
         exact
+    }
+
+    /// Lets every record go of its content, when [`holding_content`] is off.
+    pub fn let_go_of_content(&mut self) {
+        if holding_content() {
+            return;
+        }
+        for record in self.files.iter_mut().flatten() {
+            record.let_go_of_content();
+        }
+    }
+
+    /// Lets the given records go of their content, when [`holding_content`] is off.
+    ///
+    /// @param ids - the records
+    pub fn let_go_of(&mut self, ids: impl IntoIterator<Item = u32>) {
+        if holding_content() {
+            return;
+        }
+        for id in ids {
+            if let Some(Some(record)) = self.files.get_mut(id as usize) {
+                record.let_go_of_content();
+            }
+        }
     }
 
     /// An index put back together from what the store held.
@@ -366,7 +489,7 @@ impl Exact {
             .filter_map(|(id, f)| f.as_ref().map(|f| (f.rel.clone(), id as u32)))
             .collect();
         let tombstones = files.iter().filter(|f| f.is_none()).count();
-        Exact { files, by_path, postings, tombstones, generation: 0 }
+        Exact { files, by_path, postings, tombstones, generation: 0, root: None }
     }
 
     /// Adds a file under the next id, tombstoning any older copy of the same path.
@@ -446,7 +569,8 @@ impl Exact {
             return Vec::new();
         };
         let Some(piece) = record.blocks.get(block) else { return Vec::new() };
-        let mut hits = verify(matcher, &record.rel, &piece.bytes(), BinaryDetection::quit(b'\x00'));
+        let bytes = record.block_bytes(block, self.root.as_deref());
+        let mut hits = verify(matcher, &record.rel, &bytes, BinaryDetection::quit(b'\x00'));
         if piece.first_line > 1 {
             for hit in &mut hits {
                 hit.line += u64::from(piece.first_line - 1);
@@ -491,7 +615,7 @@ impl Exact {
     /// @param path - the absolute path
     fn search_explicit(&self, matcher: &RegexMatcher, rel: &str, path: &PathBuf) -> ExactAnswer {
         let bytes = match self.by_path.get(rel).and_then(|&id| self.files[id as usize].as_ref()) {
-            Some(record) if !record.is_partial() => record.bytes(),
+            Some(record) if !record.is_partial() && record.is_held() => record.bytes(),
             _ => std::fs::read(path).unwrap_or_default(),
         };
         let hits = verify(matcher, rel, &bytes, BinaryDetection::convert(b'\x00'));

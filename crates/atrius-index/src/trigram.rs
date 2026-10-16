@@ -75,42 +75,110 @@ pub fn trigrams_of_literal(text: &[u8]) -> Vec<Trigram> {
     out
 }
 
-/// One trigram's list of file ids, delta and varint encoded.
+/// A list's bytes, held in place while they are short (Unluminous `task-2279`). Two thirds of a
+/// checkout's lists are 14 bytes or less, and each used to be an allocation of its own with the
+/// allocator's header beside it: about 45,000 of them on a 2,000 file checkout.
+#[derive(Clone, Debug)]
+enum Bytes {
+    /// Up to 14 bytes, and how many.
+    Inline([u8; 14], u8),
+    /// Anything longer.
+    Heap(Vec<u8>),
+}
+
+impl Default for Bytes {
+    fn default() -> Self {
+        Bytes::Inline([0; 14], 0)
+    }
+}
+
+impl Bytes {
+    /// The bytes.
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Bytes::Inline(bytes, len) => &bytes[..*len as usize],
+            Bytes::Heap(bytes) => bytes,
+        }
+    }
+
+    /// The bytes, held in place when they fit.
+    fn from_vec(bytes: Vec<u8>) -> Bytes {
+        if bytes.len() <= 14 {
+            let mut inline = [0u8; 14];
+            inline[..bytes.len()].copy_from_slice(&bytes);
+            Bytes::Inline(inline, bytes.len() as u8)
+        } else {
+            Bytes::Heap(bytes)
+        }
+    }
+
+    /// Appends bytes, moving them out of place when they no longer fit.
+    fn extend(&mut self, more: &[u8]) {
+        match self {
+            Bytes::Inline(bytes, len) if *len as usize + more.len() <= 14 => {
+                bytes[*len as usize..*len as usize + more.len()].copy_from_slice(more);
+                *len += more.len() as u8;
+            }
+            Bytes::Inline(..) => {
+                let mut grown = self.as_slice().to_vec();
+                grown.extend_from_slice(more);
+                *self = Bytes::Heap(grown);
+            }
+            Bytes::Heap(bytes) => bytes.extend_from_slice(more),
+        }
+    }
+
+    /// What the bytes hold on the heap.
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Bytes::Inline(..) => 0,
+            Bytes::Heap(bytes) => bytes.capacity(),
+        }
+    }
+}
+
+/// One trigram's list of block ids, delta coded as variable length integers.
 #[derive(Clone, Debug, Default)]
 pub struct Posting {
     last: u32,
     count: u32,
-    bytes: Vec<u8>,
+    bytes: Bytes,
 }
 
 impl Posting {
-    /// Appends a file id, which must be larger than every id already in the list.
-    ///
-    /// @param id - the file id
+    /// Appends an id, which must be larger than the last.
     pub fn push(&mut self, id: u32) {
         let delta = if self.count == 0 { id } else { id - self.last };
-        write_varint(&mut self.bytes, delta);
+        let (mut encoded, mut len, mut value) = ([0u8; 5], 0usize, delta);
+        while value >= 0x80 {
+            encoded[len] = (value as u8) | 0x80;
+            value >>= 7;
+            len += 1;
+        }
+        encoded[len] = value as u8;
+        self.bytes.extend(&encoded[..=len]);
         self.last = id;
         self.count += 1;
     }
 
-    /// How many files the list holds, tombstoned ones included.
+    /// How many ids.
     pub fn len(&self) -> usize {
         self.count as usize
     }
 
-    /// Whether the list is empty.
+    /// Whether there are none.
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
-    /// The file ids, decoded, in increasing order.
+    /// The ids, in order.
     pub fn ids(&self) -> Vec<u32> {
+        let bytes = self.bytes.as_slice();
         let mut out = Vec::with_capacity(self.count as usize);
         let mut at = 0;
         let mut id = 0u32;
-        while at < self.bytes.len() {
-            let (delta, used) = read_varint(&self.bytes[at..]);
+        while at < bytes.len() {
+            let (delta, used) = read_varint(&bytes[at..]);
             at += used;
             id = if out.is_empty() { delta } else { id + delta };
             out.push(id);
@@ -118,29 +186,26 @@ impl Posting {
         out
     }
 
-    /// The encoded bytes, for storage.
+    /// The encoded bytes, as the store writes them.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
     }
 
-    /// A list read back from storage.
-    ///
-    /// @param bytes - the encoded bytes
+    /// A list from the bytes the store wrote.
     pub fn from_bytes(bytes: Vec<u8>) -> Posting {
-        let mut posting = Posting { last: 0, count: 0, bytes };
+        let mut posting = Posting { last: 0, count: 0, bytes: Bytes::from_vec(bytes) };
         let ids = posting.ids();
         posting.count = ids.len() as u32;
         posting.last = ids.last().copied().unwrap_or(0);
         posting
     }
 
-    /// Bytes held, for the memory figure `search status` reports.
+    /// What it holds on the heap.
     pub fn heap_bytes(&self) -> usize {
-        self.bytes.capacity()
+        self.bytes.heap_bytes()
     }
 }
 
-/// Every trigram's posting list.
 #[derive(Default, Clone)]
 pub struct Postings {
     lists: HashMap<Trigram, Posting>,
