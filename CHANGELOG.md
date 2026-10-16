@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.2
+
+- Embedding can be switched on and off while an index runs, with `atrius_index::index::set_embedding`.
+  It starts from `ATRIUS_EMBED` as before. Off, each store thread drops its embedder before its next
+  batch and a plain English search is ranked by its words, so the model is never asked again; on, a
+  store thread opens its embedder within half a second and goes on from the chunks with no vector.
+  Unluminous turns this into a setting, because the model was 1.1 GB of its window at rest.
+- The index file's buffer pool holds 32 MiB, where Inillucent's default is 128 MiB. The file is read whole
+  once when a host opens it, and the pool kept what that read filled for the life of the host. A window
+  hosting the index of a 2,000 file checkout held about 100 MB less. `ATRIUS_STORE_CACHE_FRAMES` sets
+  the number of 32 KiB pages.
+- A binary file is held in memory and in the index file only up to and including its first NUL. A
+  directory search never reads past it, which is ripgrep's rule, and a search that names the file reads
+  it from the disk, as ripgrep does. A record an older index file holds whole is cut as it loads. Results
+  are unchanged; the parity test against ripgrep covers matches before and after the NUL.
+- `search status` says `embedding is switched off` in `notEmbedding` while the switch is off. It said
+  `ATRIUS_EMBED is off` before.
+
 ## 0.2.1
 
 - A change inside a folder the ignore rules leave out is no longer indexed. The watcher walked a changed

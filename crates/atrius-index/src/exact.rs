@@ -66,9 +66,20 @@ impl FileRecord {
     /// @param bytes - the file's bytes
     pub fn from_bytes(rel: String, mtime_ns: i64, bytes: &[u8]) -> (FileRecord, Vec<Vec<u32>>) {
         let searched = searched_text(bytes);
-        let binary = memchr::memchr(0, &searched).is_some();
-        let whole = binary || matches!(searched, std::borrow::Cow::Owned(_));
-        let spans = if whole { vec![(0, bytes.len(), 1)] } else { block_spans(bytes) };
+        let first_nul = memchr::memchr(0, &searched);
+        let binary = first_nul.is_some();
+        let decoded = matches!(searched, std::borrow::Cow::Owned(_));
+        let whole = binary || decoded;
+        // **A binary file is held only up to its first NUL** (Unluminous `task-2279`). A directory search
+        // stops reading a file at its first NUL, which is ripgrep's rule and `verify_block`'s, so nothing
+        // after it can ever be a hit, and a search naming the file reads it from the disk. The 60 MB of
+        // screenshots in Unluminous's own repository were held whole in every window that hosted its index.
+        // The NUL itself is kept, because the line it is on is not a hit either and the search has to see it.
+        let held = match (first_nul, decoded) {
+            (Some(at), false) => at + 1,
+            _ => bytes.len(),
+        };
+        let spans = if whole { vec![(0, held, 1)] } else { block_spans(bytes) };
         let mut blocks = Vec::with_capacity(spans.len());
         let mut trigrams = Vec::with_capacity(spans.len());
         for (start, end, first_line) in spans {
@@ -76,8 +87,10 @@ impl FileRecord {
                 first_line,
                 packed: lz4_flex::block::compress_prepend_size(&bytes[start..end]),
             });
-            trigrams.push(if whole {
+            trigrams.push(if decoded {
                 trigrams_of(&searched)
+            } else if whole {
+                trigrams_of(&bytes[start..end])
             } else {
                 trigrams_of(&bytes[start..end])
             });
@@ -95,7 +108,41 @@ impl FileRecord {
         (record, trigrams)
     }
 
-    /// The file's bytes.
+    /// True when the record holds only the part of a binary file up to its first NUL, so the whole of
+    /// it is on the disk and nowhere else. See [`FileRecord::from_bytes`].
+    pub fn is_partial(&self) -> bool {
+        self.binary && self.held_len() < self.size
+    }
+
+    /// The record holding no more of a binary file than [`FileRecord::from_bytes`] would hold now: an index
+    /// file written before 0.2.2 kept every byte, so a record loaded from one is cut at its first NUL as it
+    /// is loaded, and its memory is given back without the file being built again.
+    pub fn held_to_its_first_nul(mut self) -> FileRecord {
+        if !self.binary || self.is_partial() || self.blocks.len() != 1 {
+            return self;
+        }
+        let bytes = self.blocks[0].bytes();
+        if matches!(searched_text(&bytes), std::borrow::Cow::Owned(_)) {
+            return self;
+        }
+        if let Some(at) = memchr::memchr(0, &bytes) {
+            self.blocks[0].packed = lz4_flex::block::compress_prepend_size(&bytes[..=at]);
+        }
+        self
+    }
+
+    /// How many of the file's bytes the record holds, read from the length each block carries.
+    fn held_len(&self) -> u64 {
+        self.blocks
+            .iter()
+            .map(|block| {
+                block.packed.get(..4).map_or(0, |n| u32::from_le_bytes([n[0], n[1], n[2], n[3]]))
+                    as u64
+            })
+            .sum()
+    }
+
+    /// The bytes the record holds: the whole file, or for a partial record the part up to its first NUL.
     pub fn bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.size as usize);
         for block in &self.blocks {
@@ -292,7 +339,14 @@ impl Exact {
     pub fn from_records(records: Vec<FileRecord>) -> Exact {
         let read: Vec<(FileRecord, Vec<Vec<u32>>)> = records
             .into_par_iter()
-            .map(|r| FileRecord::from_bytes(r.rel.clone(), r.mtime_ns, &r.bytes()))
+            .map(|r| match r.is_partial() {
+                // Taken from its bytes again, a partial record would be a whole one of a shorter file.
+                true => {
+                    let trigrams = vec![trigrams_of(&r.bytes())];
+                    (r, trigrams)
+                }
+                false => FileRecord::from_bytes(r.rel.clone(), r.mtime_ns, &r.bytes()),
+            })
             .collect();
         let mut exact = Exact::default();
         for (record, trigrams) in read {
@@ -437,8 +491,8 @@ impl Exact {
     /// @param path - the absolute path
     fn search_explicit(&self, matcher: &RegexMatcher, rel: &str, path: &PathBuf) -> ExactAnswer {
         let bytes = match self.by_path.get(rel).and_then(|&id| self.files[id as usize].as_ref()) {
-            Some(record) => record.bytes(),
-            None => std::fs::read(path).unwrap_or_default(),
+            Some(record) if !record.is_partial() => record.bytes(),
+            _ => std::fs::read(path).unwrap_or_default(),
         };
         let hits = verify(matcher, rel, &bytes, BinaryDetection::convert(b'\x00'));
         ExactAnswer { hits, in_scope: 1, candidates: 1, verified: 1, unbounded: false }
@@ -614,4 +668,30 @@ fn verify_converted(
         hits.push(Hit { path: rel.to_owned(), line, text: text.trim_end_matches('\r').to_owned() });
     }
     hits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `task-2279`: a binary file is held up to and including its first NUL, which is all a directory
+    /// search reads of it, and a record an older index file held whole is cut the same way as it loads.
+    #[test]
+    fn a_binary_file_is_held_up_to_its_first_nul() {
+        let bytes = b"match here\0match after\nand more after\n";
+        let (record, _) = FileRecord::from_bytes("bin/a.bin".into(), 0, bytes);
+        assert!(record.binary && record.is_partial());
+        assert_eq!(record.bytes(), b"match here\0");
+        assert_eq!(record.size, bytes.len() as u64, "the size is the file's");
+
+        let whole = FileRecord {
+            blocks: vec![Block { first_line: 1, packed: lz4_flex::block::compress_prepend_size(bytes) }],
+            ..record.clone()
+        };
+        assert!(!whole.is_partial(), "an older index file held every byte");
+        assert_eq!(whole.held_to_its_first_nul().bytes(), b"match here\0");
+
+        let (text, _) = FileRecord::from_bytes("src/a.rs".into(), 0, b"fn main() {}\n");
+        assert!(!text.is_partial() && text.bytes() == b"fn main() {}\n", "text is held whole");
+    }
 }

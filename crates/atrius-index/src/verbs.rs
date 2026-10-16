@@ -882,6 +882,7 @@ fn file_text(index: &Index, rel: &str) -> Option<String> {
                 .by_path
                 .get(rel)
                 .and_then(|&id| exact.files[id as usize].as_ref())
+                .filter(|r| !r.is_partial())
                 .map(|r| r.bytes())
         })
         .flatten();
@@ -1101,7 +1102,7 @@ fn semantic(index: &Index, asked: &FindRequest) -> Result<Value, Refusal> {
         Ok(found) => found,
         Err(why) => return by_the_words(index, asked, &why),
     };
-    let with_vectors = index.status().vectors > 0;
+    let with_vectors = index.status().vectors > 0 && crate::index::embedding_enabled();
     let question_words = crate::words::query_words(&asked.query);
     let mut chosen = Vec::new();
     let mut text = String::new();

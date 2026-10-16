@@ -101,6 +101,22 @@ pub fn cache_folder() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
+/// How many 32 KiB pages the index file's buffer pool holds: 1,024, which is 32 MiB, or
+/// `ATRIUS_STORE_CACHE_FRAMES`.
+///
+/// Inillucent's default is 4,096, 128 MiB, which is right for a database that answers queries from its
+/// pages. This one is read whole once when a host opens it, into the exact index and the symbol table held
+/// in memory, and after that it is written a batch at a time and asked a passage search now and then. The
+/// pool filled to its 128 MiB during that one read and kept it for the life of the host, which in an
+/// editor that hosts its project's index is the editor's whole life (Unluminous `task-2279`).
+pub fn cache_frames() -> usize {
+    std::env::var("ATRIUS_STORE_CACHE_FRAMES")
+        .ok()
+        .and_then(|n| n.trim().parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1024)
+}
+
 impl Store {
     /// Opens or creates the index file in a folder, with its schema.
     ///
@@ -109,7 +125,8 @@ impl Store {
         std::fs::create_dir_all(folder)
             .map_err(|e| format!("cannot create {}: {e}", folder.display()))?;
         let path = folder.join("index.rdb");
-        let options = OpenOptions { create: true, ..OpenOptions::default() };
+        let options =
+            OpenOptions { create: true, cache_frames: cache_frames(), ..OpenOptions::default() };
         let database = Database::open_with(&path, options).map_err(|e| e.to_string())?;
         database.session().execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         Ok(Store { database, path })
@@ -348,7 +365,8 @@ impl Store {
                 blocks: unpack_blocks(row.get(7).and_then(Value::bytes).unwrap_or_default()),
                 binary: int(5) != 0,
                 lines: int(6) as u32,
-            });
+            }
+            .held_to_its_first_nul());
         }
         Ok(Exact::restore(files, postings))
     }

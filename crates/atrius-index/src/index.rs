@@ -524,10 +524,36 @@ fn store_thread(
             None
         }
     };
+    // Whether the embedder is missing because the switch is off, rather than because there is no model.
+    let mut switched_off = !embedding_enabled();
     loop {
         if let Some(job) = first_job.take() {
             run_a_job(&store, root, status, embedder.as_mut(), job);
             continue;
+        }
+        // **The switch is read on every pass** (Unluminous `task-2279`), so turning embedding off stops it
+        // before the next batch and turning it on starts it within one wait below.
+        match (embedding_enabled(), switched_off) {
+            (false, false) => {
+                embedder = None;
+                switched_off = true;
+                lock(status).not_embedding = Some(SWITCHED_OFF.into());
+            }
+            (true, true) => {
+                switched_off = false;
+                lock(status).not_embedding = None;
+                embedder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Embedder::open(&store, status)
+                }))
+                .unwrap_or_else(|panic| {
+                    lock(status).not_embedding = Some(format!(
+                        "checking for the embedding model panicked: {}",
+                        panic_message(&panic)
+                    ));
+                    None
+                });
+            }
+            _ => {}
         }
         // Embedding is done a small batch at a time, only when no other job is waiting, so a query
         // never waits behind more than one batch.
@@ -551,6 +577,13 @@ fn store_thread(
                     continue;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            },
+            // Woken at least twice a second while embedding is switched off, so switching it on is noticed
+            // without a job arriving.
+            None if switched_off => match jobs.recv_timeout(Duration::from_millis(500)) {
+                Ok(job) => job,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             },
             None => match jobs.recv() {
                 Ok(job) => job,
@@ -682,7 +715,7 @@ fn run_a_job(
         }
         StoreJob::Full { index } => store.save_exact(&index, root),
         StoreJob::Search { question, k, kind, reply } => {
-            let vectors = lock(status).vectors > 0;
+            let vectors = lock(status).vectors > 0 && embedding_enabled();
             let _ = reply.send(passages::search(
                 &store.session(),
                 &question,
@@ -713,6 +746,41 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "no message".to_owned())
 }
 
+/// Whether this process embeds passages and asks the model about questions. Read from `ATRIUS_EMBED`
+/// the first time it is asked, and changed while the process runs by [`set_embedding`].
+static EMBEDDING: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+
+/// The switch, made from `ATRIUS_EMBED` the first time.
+fn embedding_switch() -> &'static std::sync::atomic::AtomicBool {
+    EMBEDDING.get_or_init(|| {
+        let off = std::env::var("ATRIUS_EMBED").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
+        std::sync::atomic::AtomicBool::new(!off)
+    })
+}
+
+/// Whether this process embeds: `ATRIUS_EMBED` unless [`set_embedding`] has said otherwise.
+pub fn embedding_enabled() -> bool {
+    embedding_switch().load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Turns embedding on or off for every index this process holds, while they run.
+///
+/// Off, each store thread drops its embedder on its next pass, so no batch starts after this returns,
+/// and a plain English search is answered from the passages' words, so nothing asks the model again.
+/// The model's memory is returned by its residency, which a host sets with
+/// `INILLUCENT_EMBED_RESIDENCY`. On, a store thread opens its embedder within half a second and carries
+/// on from the chunks that still have no vector. An editor that has a setting for this calls it when the
+/// setting changes (Unluminous `task-2279`, where the model was 1.1 GB of a window at rest and the only
+/// way to stop it was the environment).
+///
+/// @param on - whether to embed
+pub fn set_embedding(on: bool) {
+    embedding_switch().store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// What `search status` says while embedding is switched off.
+const SWITCHED_OFF: &str = "embedding is switched off";
+
 /// The background embedder: whether `embed()` works here, the shared cache of vectors by chunk hash,
 /// and whether chunks are still waiting for a vector.
 struct Embedder {
@@ -732,8 +800,8 @@ pub const PROCESSOR_CHUNK_LIMIT: usize = 100_000;
 ///
 /// @param chunks - how many chunks the passage table holds
 fn why_not_embed(chunks: usize) -> Option<String> {
-    if std::env::var("ATRIUS_EMBED").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off")) {
-        return Some("ATRIUS_EMBED is off".into());
+    if !embedding_enabled() {
+        return Some(SWITCHED_OFF.into());
     }
     let on_a_card = std::env::var("INILLUCENT_EMBED_DEVICE")
         .is_ok_and(|d| d.trim().to_ascii_lowercase().starts_with("cuda"));
@@ -773,7 +841,14 @@ impl Embedder {
         let folder = store::cache_folder().join("atrius-index").join("embeddings");
         let cache = std::fs::create_dir_all(&folder)
             .ok()
-            .and_then(|_| Database::open(folder.join("embeddings.rdb")).ok());
+            .and_then(|_| {
+                let options = inillucent_driver::OpenOptions {
+                    create: true,
+                    cache_frames: store::cache_frames(),
+                    ..inillucent_driver::OpenOptions::default()
+                };
+                Database::open_with(folder.join("embeddings.rdb"), options).ok()
+            });
         if let Some(c) = &cache {
             let _ = c.session().execute_batch(
                 "CREATE TABLE IF NOT EXISTS emb (hash BLOB PRIMARY KEY, model TEXT, vector BLOB);",
