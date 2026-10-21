@@ -65,6 +65,20 @@ fn fixture(dir: &Path) {
     write("node_modules/pkg/index.js", b"Hello from a dependency\n");
     write("debug.log", b"Hello from a log\n");
     write("src/words.txt", b"testing running\nnothing\n");
+    // Two files larger than the index ever reads whole (Unluminous `task-2323`): a log that is searched
+    // from the disk in pieces, and a disk image read only as far as its first NUL.
+    let mut log = Vec::with_capacity(41 * 1024 * 1024);
+    let mut row = 0u64;
+    while log.len() < 40 * 1024 * 1024 {
+        log.extend_from_slice(format!("row {row} of a long log\n").as_bytes());
+        row += 1;
+    }
+    log.extend_from_slice(b"the needle at the end of the log\n");
+    write("huge/server.log.txt", &log);
+    let mut image = b"match in the image header\n\0".to_vec();
+    image.resize(40 * 1024 * 1024, 0);
+    image.extend_from_slice(b"\nmatch far past the header\n");
+    write("huge/disk.img", &image);
 }
 
 /// What ripgrep answers, with the Grep tool's flags, as a set of `path:line`.
@@ -117,7 +131,10 @@ fn every_fixture_search_gives_ripgreps_lines() {
     let mut on_disk = held.clone();
     on_disk.let_go_of_content();
     atrius_index::exact::set_holding_content(true);
-    assert!(on_disk.files.iter().flatten().all(|r| !r.is_held() || r.size == 0), "nothing is held");
+    assert!(
+        on_disk.files.iter().flatten().all(|r| !r.is_held() || r.size == 0 || r.is_large()),
+        "nothing is held"
+    );
     let cases: &[(&str, bool, &str)] = &[
         ("Hello", false, "."),
         ("hello", true, "."),
@@ -156,4 +173,33 @@ fn every_fixture_search_gives_ripgreps_lines() {
         }
     }
     assert!(differences.is_empty(), "{}", differences.join("\n"));
+}
+
+/// A file larger than [`atrius_index::exact::LARGEST_HELD`] is never in memory whole (Unluminous
+/// `task-2323`, a window that reached 180 GB): the log is a record with nothing held, the disk image holds
+/// only its header, and the whole index is a few megabytes however large the two files are.
+#[test]
+fn a_file_larger_than_the_limit_is_never_held_whole() {
+    let dir = tempfile::tempdir().expect("a folder");
+    fixture(dir.path());
+    let exact = Exact::build(dir.path());
+    let record = |rel: &str| {
+        let id = exact.by_path[rel];
+        exact.files[id as usize].clone().expect("a live record")
+    };
+    let log = record("huge/server.log.txt");
+    assert!(log.is_large() && log.blocks.is_empty(), "the log holds nothing");
+    assert!(log.size > atrius_index::exact::LARGEST_HELD);
+    let image = record("huge/disk.img");
+    assert!(image.binary && image.is_partial() && !image.is_large());
+    assert_eq!(image.bytes(), b"match in the image header\n\0");
+    assert!(exact.heap_bytes() < 8 * 1024 * 1024, "the index is {} bytes", exact.heap_bytes());
+
+    let scope = Scope::everything();
+    let request =
+        ExactRequest { pattern: "needle at the end", case_insensitive: false, scope: &scope };
+    let hits = exact.search(dir.path(), &request).expect("searched").hits;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].path, "huge/server.log.txt");
+    assert_eq!(hits[0].text, "the needle at the end of the log");
 }

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.1
+
+No file is read into memory whole when it is larger than 32 MB (`exact::LARGEST_HELD`). A macOS hang
+report from Unluminous 1.3.3 showed a window at a footprint of 180 GB on a 64 GB Mac, with all fourteen
+indexing threads inside `FileRecord::read`: every file in the project was read whole, so one disk image
+or log of tens of gigabytes was enough to take the whole machine's memory.
+
+- A text file larger than the limit is a record that holds nothing and has no trigrams. Every search
+  is a candidate for it and reads it from the disk in pieces, the way ripgrep reads a file it does not
+  map, so the lines found are the same. `FileRecord::is_large` says which records these are.
+- A binary file larger than the limit is read only up to its first NUL, which is all a directory search
+  reads of it.
+- A file that grows while it is read stops at the limit too, because the read is bounded by bytes read
+  and not by the size the file had when it was listed.
+- The freshness gate, the direct scan and the `fragment` and `outline` verbs read files the same bounded
+  way. `exact::read_bounded` is the one function that does it.
+- `Exact::build` reads and adds 1,024 files at a time, so the trigram lists waiting to be added are those
+  of one slice of the project rather than of all of it.
+- The schema version is 5, so an index written before this, which may hold such a file whole and would
+  read it into memory as it loads, is replaced.
+- The parity test against ripgrep gained a 40 MB log and a 40 MB disk image.
+
 ## 0.3.0
 
 A loaded index holds about a third of the memory it did. Measured on the Unluminous checkout (2,000

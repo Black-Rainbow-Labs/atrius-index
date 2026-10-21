@@ -55,8 +55,47 @@ impl FileRecord {
     /// @param root - the root
     /// @param found - the file as the walk found it
     pub fn read(root: &Path, found: &Found) -> Option<(FileRecord, Vec<Vec<u32>>)> {
-        let bytes = std::fs::read(root.join(&found.rel)).ok()?;
-        Some(FileRecord::from_bytes(found.rel.clone(), found.mtime_ns, &bytes))
+        let reading = read_bounded(&root.join(&found.rel)).ok()?;
+        Some(FileRecord::from_reading(found.rel.clone(), found.mtime_ns, reading))
+    }
+
+    /// A record and its trigrams from what [`read_bounded`] read of a file.
+    ///
+    /// @param rel - the path relative to the root
+    /// @param mtime_ns - the modification time
+    /// @param reading - what was read
+    pub fn from_reading(
+        rel: String,
+        mtime_ns: i64,
+        reading: Reading,
+    ) -> (FileRecord, Vec<Vec<u32>>) {
+        match reading {
+            Reading::Whole(bytes) => FileRecord::from_bytes(rel, mtime_ns, &bytes),
+            Reading::UpToNul { held, size } => {
+                let (mut record, trigrams) = FileRecord::from_bytes(rel, mtime_ns, &held);
+                record.size = size;
+                record.hash = reading_hash(&held, size, mtime_ns, false);
+                (record, trigrams)
+            }
+            Reading::Large { size } => {
+                let record = FileRecord {
+                    rel,
+                    size,
+                    mtime_ns,
+                    hash: reading_hash(&[], size, mtime_ns, true),
+                    blocks: Vec::new(),
+                    binary: false,
+                    lines: 0,
+                };
+                (record, Vec::new())
+            }
+        }
+    }
+
+    /// True for a text file larger than [`LARGEST_HELD`]: the record holds nothing of it and has no
+    /// trigrams, and every search reads it from the disk as it goes. See [`read_bounded`].
+    pub fn is_large(&self) -> bool {
+        self.blocks.is_empty() && self.size > 0
     }
 
     /// A record and its trigrams from a file's bytes.
@@ -147,10 +186,16 @@ impl FileRecord {
     ///
     /// @param root - the root the record's path is under
     pub fn content(&self, root: Option<&Path>) -> Option<Vec<u8>> {
+        if self.is_large() {
+            return None;
+        }
         if self.is_held() {
             return Some(self.bytes());
         }
-        let mut bytes = std::fs::read(root?.join(&self.rel)).ok()?;
+        let mut bytes = match read_bounded(&root?.join(&self.rel)).ok()? {
+            Reading::Whole(bytes) | Reading::UpToNul { held: bytes, .. } => bytes,
+            Reading::Large { .. } => return None,
+        };
         if self.binary && matches!(searched_text(&bytes), std::borrow::Cow::Borrowed(_)) {
             if let Some(at) = memchr::memchr(0, &bytes) {
                 bytes.truncate(at + 1);
@@ -341,6 +386,113 @@ fn block_spans(bytes: &[u8]) -> Vec<(usize, usize, u32)> {
     spans
 }
 
+/// The largest file read into memory whole. A text file larger than this is never read whole and never
+/// held: it is a record with no blocks and no trigrams, every search is a candidate for it, and the
+/// search reads it from the disk in pieces the way ripgrep reads a file it does not map. A binary file
+/// larger than this is read only up to its first NUL, which is all a directory search reads of it.
+///
+/// Unluminous 1.3.3 on macOS (`task-2323`): a window whose project held large files read each one whole
+/// on fourteen threads at once, and the process reached a footprint of 180 GB on a 64 GB Mac and stopped
+/// answering. Nothing bounded a single read, so one disk image or log of tens of gigabytes was enough.
+pub const LARGEST_HELD: u64 = 32 * 1024 * 1024;
+
+/// What [`read_bounded`] read of a file.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// The whole file, which is no larger than the limit.
+    Whole(Vec<u8>),
+    /// A larger binary file, read up to and including its first NUL.
+    UpToNul {
+        /// The bytes up to and including the first NUL.
+        held: Vec<u8>,
+        /// The file's size.
+        size: u64,
+    },
+    /// A larger file with no NUL within the limit, of which nothing is kept.
+    Large {
+        /// The file's size.
+        size: u64,
+    },
+}
+
+/// How much of a file is read at a time.
+const READ_PIECE: usize = 1024 * 1024;
+
+/// Reads a file without ever holding more than [`LARGEST_HELD`] bytes of it: the whole of a file that
+/// size or smaller, the start of a larger binary file up to its first NUL, and nothing of any other larger
+/// file. A file that grows while it is read is bounded the same way, because the read stops at the limit
+/// rather than at the size the file had when it was listed.
+///
+/// @param path - the file
+pub fn read_bounded(path: &Path) -> std::io::Result<Reading> {
+    read_bounded_at(path, LARGEST_HELD)
+}
+
+/// [`read_bounded`] with the limit given, so a test can use a small one.
+///
+/// @param path - the file
+/// @param limit - the most bytes read into memory
+pub fn read_bounded_at(path: &Path, limit: u64) -> std::io::Result<Reading> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let listed = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut held = Vec::with_capacity(listed.min(limit) as usize);
+    let mut piece = vec![0u8; READ_PIECE.min(limit as usize + 1)];
+    while held.len() as u64 <= limit {
+        let want = piece.len().min(limit as usize + 1 - held.len());
+        let got = file.read(&mut piece[..want])?;
+        if got == 0 {
+            return Ok(Reading::Whole(held));
+        }
+        let start = held.len();
+        held.extend_from_slice(&piece[..got]);
+        // A file listed larger than the limit stops at its first NUL, so a disk image is read only as
+        // far as that. A file that fits is read whole, so its record keeps the hash of every byte.
+        if listed > limit && !utf16(&held) {
+            if let Some(at) = memchr::memchr(0, &held[start..]) {
+                held.truncate(start + at + 1);
+                held.shrink_to_fit();
+                return Ok(Reading::UpToNul { held, size: listed });
+            }
+        }
+    }
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0).max(held.len() as u64);
+    if !utf16(&held) {
+        if let Some(at) = memchr::memchr(0, &held[..limit as usize]) {
+            held.truncate(at + 1);
+            held.shrink_to_fit();
+            return Ok(Reading::UpToNul { held, size });
+        }
+    }
+    Ok(Reading::Large { size })
+}
+
+/// Whether bytes start with a UTF-16 byte order mark, which ripgrep decodes before it searches, so a NUL
+/// in them does not make the file binary.
+///
+/// @param bytes - the start of a file
+fn utf16(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF])
+}
+
+/// The hash of a file that was not read whole: the part that was read, the size and, for a file of which
+/// nothing was kept, the modification time, so a change to any of them is a change to the record.
+///
+/// @param held - the bytes read
+/// @param size - the file's size
+/// @param mtime_ns - its modification time
+/// @param large - whether nothing of it was kept
+fn reading_hash(held: &[u8], size: u64, mtime_ns: i64, large: bool) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(if large { b"atrius-large" } else { b"atrius-upto0" });
+    hasher.update(&size.to_le_bytes());
+    if large {
+        hasher.update(&mtime_ns.to_le_bytes());
+    }
+    hasher.update(held);
+    *hasher.finalize().as_bytes()
+}
+
 /// The text ripgrep actually searches in a file: a file starting with a UTF-16 byte order mark is
 /// decoded to UTF-8 first, as ripgrep's default `--encoding auto` does; anything else is searched as it
 /// is.
@@ -392,6 +544,9 @@ pub struct ExactRequest<'a> {
     pub scope: &'a Scope,
 }
 
+/// How many files [`Exact::build`] reads before it adds them to the index.
+const BUILD_SLICE: usize = 1024;
+
 /// The in-memory exact index of one root.
 #[derive(Default, Clone)]
 pub struct Exact {
@@ -416,11 +571,15 @@ impl Exact {
     /// @param root - the root
     pub fn build(root: &Path) -> Exact {
         let found = files::walk(root);
-        let read: Vec<Option<(FileRecord, Vec<Vec<u32>>)>> =
-            found.par_iter().map(|f| FileRecord::read(root, f)).collect();
         let mut exact = Exact { root: Some(root.to_path_buf()), ..Exact::default() };
-        for (record, trigrams) in read.into_iter().flatten() {
-            exact.insert(record, &trigrams);
+        // A slice of the files is read and added before the next is read, so the trigram lists waiting
+        // to be added are those of one slice rather than of the whole project.
+        for slice in found.chunks(BUILD_SLICE) {
+            let read: Vec<Option<(FileRecord, Vec<Vec<u32>>)>> =
+                slice.par_iter().map(|f| FileRecord::read(root, f)).collect();
+            for (record, trigrams) in read.into_iter().flatten() {
+                exact.insert(record, &trigrams);
+            }
         }
         exact
     }
@@ -434,6 +593,8 @@ impl Exact {
         let read: Vec<(FileRecord, Vec<Vec<u32>>)> = records
             .into_par_iter()
             .filter_map(|r| match (r.is_held(), r.is_partial()) {
+                // A large record has nothing to take trigrams from.
+                _ if r.is_large() => Some((r, Vec::new())),
                 // Taken from its bytes again, a partial record would be a whole one of a shorter file.
                 (true, true) => {
                     let trigrams = vec![trigrams_of(&r.bytes())];
@@ -442,8 +603,8 @@ impl Exact {
                 (true, false) => Some(FileRecord::from_bytes(r.rel.clone(), r.mtime_ns, &r.bytes())),
                 // A record that let go of its content is read again from the file.
                 (false, _) => {
-                    let bytes = std::fs::read(root?.join(&r.rel)).ok()?;
-                    Some(FileRecord::from_bytes(r.rel.clone(), r.mtime_ns, &bytes))
+                    let reading = read_bounded(&root?.join(&r.rel)).ok()?;
+                    Some(FileRecord::from_reading(r.rel.clone(), r.mtime_ns, reading))
                 }
             })
             .collect();
@@ -568,6 +729,10 @@ impl Exact {
         let Some(record) = self.files.get(file as usize).and_then(Option::as_ref) else {
             return Vec::new();
         };
+        if record.is_large() {
+            let Some(root) = self.root.as_deref() else { return Vec::new() };
+            return verify_path(matcher, &record.rel, &root.join(&record.rel));
+        }
         let Some(piece) = record.blocks.get(block) else { return Vec::new() };
         let bytes = record.block_bytes(block, self.root.as_deref());
         let mut hits = verify(matcher, &record.rel, &bytes, BinaryDetection::quit(b'\x00'));
@@ -593,7 +758,23 @@ impl Exact {
         } else {
             self.by_path.keys().filter(|rel| request.scope.contains(rel)).count()
         };
-        let allowed = self.evaluate(&query);
+        let mut allowed = self.evaluate(&query);
+        if query != Query::All {
+            // A large file has no trigrams, so no query lets it through, and every search reads it.
+            let before = allowed.len();
+            allowed.extend(
+                self.by_path
+                    .values()
+                    .filter(|&&file| {
+                        self.files[file as usize].as_ref().is_some_and(FileRecord::is_large)
+                    })
+                    .map(|&file| block_id(file, 0)),
+            );
+            if allowed.len() > before {
+                allowed.sort_unstable();
+                allowed.dedup();
+            }
+        }
         let ids = allowed
             .into_iter()
             .filter(|&unit| {
@@ -615,7 +796,9 @@ impl Exact {
     /// @param path - the absolute path
     fn search_explicit(&self, matcher: &RegexMatcher, rel: &str, path: &PathBuf) -> ExactAnswer {
         let bytes = match self.by_path.get(rel).and_then(|&id| self.files[id as usize].as_ref()) {
-            Some(record) if !record.is_partial() && record.is_held() => record.bytes(),
+            Some(record) if !record.is_partial() && !record.is_large() && record.is_held() => {
+                record.bytes()
+            }
             _ => std::fs::read(path).unwrap_or_default(),
         };
         let hits = verify(matcher, rel, &bytes, BinaryDetection::convert(b'\x00'));
@@ -632,7 +815,7 @@ impl Exact {
                     .by_path
                     .values()
                     .filter_map(|&file| {
-                        self.files[file as usize].as_ref().map(|r| (file, r.blocks.len()))
+                        self.files[file as usize].as_ref().map(|r| (file, r.blocks.len().max(1)))
                     })
                     .flat_map(|(file, blocks)| (0..blocks).map(move |b| block_id(file, b)))
                     .collect();
@@ -746,6 +929,33 @@ pub fn verify(
     hits
 }
 
+/// Runs the regex over a file read from the disk in pieces, as ripgrep searches a file it does not map,
+/// stopping at the first NUL. It is how a file larger than [`LARGEST_HELD`] is searched, so the file is
+/// never in memory whole.
+///
+/// @param matcher - the regex
+/// @param rel - the file's path, for the hits
+/// @param path - the file
+pub fn verify_path(matcher: &RegexMatcher, rel: &str, path: &Path) -> Vec<Hit> {
+    let mut searcher: Searcher = SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .bom_sniffing(true)
+        .build();
+    let mut hits = Vec::new();
+    let sink = Bytes(|line, text| {
+        let text = String::from_utf8_lossy(text);
+        hits.push(Hit {
+            path: rel.to_owned(),
+            line,
+            text: text.trim_end_matches(['\n', '\r']).to_owned(),
+        });
+        Ok(true)
+    });
+    let _ = searcher.search_path(matcher, path, sink);
+    hits
+}
+
 /// Searches a binary file named as the search path. The searcher turns each NUL into a line break to
 /// keep going, so the line numbers it counts include those breaks; ripgrep reports the file's real line,
 /// so each match's byte offset is mapped back to the line it is on, and a real line is reported once.
@@ -817,5 +1027,49 @@ mod tests {
 
         let (text, _) = FileRecord::from_bytes("src/a.rs".into(), 0, b"fn main() {}\n");
         assert!(!text.is_partial() && text.bytes() == b"fn main() {}\n", "text is held whole");
+    }
+
+    /// `task-2323`: a read never holds more than its limit. A file within it is read whole, a larger
+    /// binary file up to its first NUL, a larger text file not at all, and a UTF-16 file's NULs do not
+    /// make it binary.
+    #[test]
+    fn a_read_holds_no_more_than_its_limit() {
+        let dir = tempfile::tempdir().expect("a folder");
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let small = write("small.txt", b"0123456789");
+        assert_eq!(read_bounded_at(&small, 10).unwrap(), Reading::Whole(b"0123456789".to_vec()));
+
+        let text = write("text.txt", &b"line\n".repeat(100));
+        assert_eq!(read_bounded_at(&text, 64).unwrap(), Reading::Large { size: 500 });
+
+        let mut image = b"head\n\0".to_vec();
+        image.resize(500, 0);
+        let image = write("disk.img", &image);
+        assert_eq!(
+            read_bounded_at(&image, 64).unwrap(),
+            Reading::UpToNul { held: b"head\n\0".to_vec(), size: 500 }
+        );
+
+        let mut late = b"text\n".repeat(100);
+        late.push(0);
+        let late = write("late.bin", &late);
+        assert_eq!(read_bounded_at(&late, 64).unwrap(), Reading::Large { size: 501 });
+
+        let mut wide = vec![0xFF, 0xFE];
+        for unit in "wide text\n".repeat(20).encode_utf16() {
+            wide.extend_from_slice(&unit.to_le_bytes());
+        }
+        let wide = write("wide.txt", &wide);
+        assert!(matches!(read_bounded_at(&wide, 64).unwrap(), Reading::Large { .. }));
+
+        let (record, trigrams) =
+            FileRecord::from_reading("t.txt".into(), 7, Reading::Large { size: 500 });
+        assert!(
+            record.is_large() && trigrams.is_empty() && record.content(Some(dir.path())).is_none()
+        );
     }
 }

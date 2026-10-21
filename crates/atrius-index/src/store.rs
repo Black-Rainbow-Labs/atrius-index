@@ -30,7 +30,11 @@ use std::collections::HashMap;
 /// of every file, and the Unluminous checkout's had reached 11.7 GB (Unluminous `task-2247`). A file of an
 /// older version is deleted and made again rather than emptied, because emptying it leaves the file its
 /// size on disk.
-pub const SCHEMA_VERSION: &str = "4";
+///
+/// `5` is the same tables. It is raised so every index written before a file larger than
+/// `exact::LARGEST_HELD` stopped being held is replaced: such an index holds those files whole, and
+/// loading it reads them into memory (Unluminous `task-2323`).
+pub const SCHEMA_VERSION: &str = "5";
 /// The trigram engine's version: how bytes are folded and which trigrams are kept.
 pub const TRIGRAM_VERSION: &str = "1";
 /// The structural reading's version: what `crate::structure` takes out of a definition. A different

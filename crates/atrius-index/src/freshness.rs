@@ -238,14 +238,15 @@ fn reconcile(
         if !stat_changed && !named.contains(&found.rel) {
             continue;
         }
-        let Ok(bytes) = std::fs::read(root.join(&found.rel)) else { continue };
+        let Ok(reading) = crate::exact::read_bounded(&root.join(&found.rel)) else { continue };
+        let (record, trigrams) =
+            FileRecord::from_reading(found.rel.clone(), found.mtime_ns, reading);
         if let Some(r) = current {
-            if !stat_changed && r.hash == *blake3::hash(&bytes).as_bytes() {
+            if !stat_changed && r.hash == record.hash {
                 continue;
             }
             report.removed.push(exact.by_path[&found.rel]);
         }
-        let (record, trigrams) = FileRecord::from_bytes(found.rel.clone(), found.mtime_ns, &bytes);
         exact.insert(record.clone(), &trigrams);
         report.changed.push((exact.files.len() as u32 - 1, record, trigrams));
     }

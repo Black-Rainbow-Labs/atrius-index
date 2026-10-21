@@ -11,7 +11,7 @@ use std::path::Path;
 use grep_searcher::BinaryDetection;
 use rayon::prelude::*;
 
-use crate::exact::{matcher, verify, ExactAnswer, ExactRequest, Hit};
+use crate::exact::{matcher, verify, verify_path, ExactAnswer, ExactRequest, Hit, LARGEST_HELD};
 use crate::files;
 
 /// Runs one exact search by walking the root and verifying every file in scope.
@@ -30,6 +30,10 @@ pub fn scan(root: &Path, request: &ExactRequest) -> Result<ExactAnswer, String> 
     let mut hits: Vec<Hit> = found
         .par_iter()
         .flat_map_iter(|f| {
+            // A file larger than the index reads whole is searched in pieces, as the index searches it.
+            if f.size > LARGEST_HELD {
+                return verify_path(&matcher, &f.rel, &root.join(&f.rel));
+            }
             let bytes = std::fs::read(root.join(&f.rel)).unwrap_or_default();
             verify(&matcher, &f.rel, &bytes, BinaryDetection::quit(b'\x00'))
         })

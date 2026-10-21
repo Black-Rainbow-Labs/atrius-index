@@ -883,11 +883,18 @@ fn file_text(index: &Index, rel: &str) -> Option<String> {
                 .by_path
                 .get(rel)
                 .and_then(|&id| exact.files[id as usize].as_ref())
-                .filter(|r| !r.is_partial() && r.is_held())
+                .filter(|r| !r.is_partial() && !r.is_large() && r.is_held())
                 .map(|r| r.bytes())
         })
         .flatten();
-    let bytes = held.or_else(|| std::fs::read(index.root().join(rel)).ok())?;
+    // A file larger than the index ever reads whole is not read whole here either.
+    let bytes = match held {
+        Some(bytes) => bytes,
+        None => match crate::exact::read_bounded(&index.root().join(rel)).ok()? {
+            crate::exact::Reading::Whole(bytes) => bytes,
+            _ => return None,
+        },
+    };
     Some(String::from_utf8_lossy(&crate::exact::searched_text(&bytes)).into_owned())
 }
 
