@@ -13,6 +13,19 @@
 //! own and waits for that file's event: events are delivered in order, so once the fence's arrives every
 //! event queued before it has arrived too. The fence goes inside `.git` when that is a folder, where git
 //! ignores unknown files and the index never looks.
+//!
+//! **A root with no `.git` keeps its fence in the index's own folder** (Unluminous `task-2370`). It used to
+//! go into the root itself, so every query put a file into the person's project for up to 250 ms: a sync
+//! client, a build watcher or another editor saw it come and go, a listing could count it and a copy
+//! could fail on it. `<index folder>/fence` is added to the same watcher instead. Linux reads every watch
+//! through one inotify descriptor and macOS through one FSEvents stream, so the order holds there as it
+//! did. Windows gives each watched folder a `ReadDirectoryChangesW` handle of its own, and a root batch
+//! the watcher's thread has not reached yet can be delivered after the fence. So with the fence outside
+//! the root the gate notes how many root events had been delivered before it wrote the fence, and writes
+//! another when any arrived between the write and the fence's own event. A round with none in between
+//! shows every root event from before the write was delivered: a root read that completed before the
+//! write is queued ahead of the fence's and runs first, and a root read that was not pending is reissued
+//! by a completion that also runs first, so its change is either delivered in that round or counted.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -43,11 +56,13 @@ struct Dirty {
     overflow: bool,
 }
 
-/// The fence: the last sequence number whose event has arrived.
+/// The fence: the last sequence number whose event has arrived, and how many root events have.
 #[derive(Default)]
 struct FenceSeen {
     seen: Mutex<u64>,
     arrived: Condvar,
+    /// Events delivered for paths that are not fences. Read only when the fence is outside the root.
+    root_events: AtomicU64,
 }
 
 /// The watcher and the dirty set of one root.
@@ -56,6 +71,8 @@ pub struct Freshness {
     dirty: Arc<Mutex<Dirty>>,
     fence: Arc<FenceSeen>,
     fence_folder: PathBuf,
+    /// Whether the fence folder is outside the root, watched through a handle of its own.
+    fence_apart: bool,
     next_fence: AtomicU64,
     _watcher: Option<RecommendedWatcher>,
 }
@@ -86,19 +103,36 @@ impl Freshness {
         let dirty = Arc::new(Mutex::new(Dirty { overflow: false, ..Dirty::default() }));
         let fence = Arc::new(FenceSeen::default());
         let git = root.join(".git");
-        let fence_folder = if git.is_dir() { git } else { root.to_path_buf() };
-        let watcher = watch(root, Arc::clone(&dirty), Arc::clone(&fence));
+        let apart = if git.is_dir() { None } else { own_fence_folder(root) };
+        let (watcher, fence_apart) =
+            match watch(root, apart.as_deref(), Arc::clone(&dirty), Arc::clone(&fence)) {
+                Some((watcher, watched_apart)) => (Some(watcher), watched_apart),
+                None => (None, false),
+            };
         if watcher.is_none() {
             dirty.lock().expect("dirty").overflow = true;
         }
+        let fence_folder = match apart {
+            _ if git.is_dir() => git,
+            Some(folder) if fence_apart => folder,
+            // The index's folder could not be made or watched: the root is the one place left whose
+            // events are certain to be in order with the root's own.
+            _ => root.to_path_buf(),
+        };
         Freshness {
             root: root.to_path_buf(),
             dirty,
             fence,
             fence_folder,
+            fence_apart,
             next_fence: AtomicU64::new(1),
             _watcher: watcher,
         }
+    }
+
+    /// Where the fence files are written: `.git`, the index's own `fence` folder, or the root.
+    pub fn fence_folder(&self) -> &Path {
+        &self.fence_folder
     }
 
     /// Whether anything is waiting to be reconciled.
@@ -112,14 +146,34 @@ impl Freshness {
         self.dirty.lock().expect("dirty").overflow = true;
     }
 
-    /// Writes a fence file and waits for its event, so every event queued before now has been seen.
+    /// Writes fences until every event queued before now has been seen, or the time runs out. A fence in
+    /// the root's own watch needs one; a fence watched apart needs a round with no root event delivered
+    /// between its write and its arrival.
     fn fence(&self) -> bool {
+        let deadline = Instant::now() + FENCE_WAIT;
+        loop {
+            let before = self.fence.root_events.load(Ordering::SeqCst);
+            if !self.one_fence(deadline) {
+                return false;
+            }
+            if !self.fence_apart || self.fence.root_events.load(Ordering::SeqCst) == before {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
+    /// Writes one fence file and waits for its event until the deadline.
+    ///
+    /// @param deadline - when to stop waiting
+    fn one_fence(&self, deadline: Instant) -> bool {
         let seq = self.next_fence.fetch_add(1, Ordering::SeqCst);
         let path = self.fence_folder.join(format!("{FENCE_PREFIX}{seq}"));
         if std::fs::write(&path, b"").is_err() {
             return false;
         }
-        let deadline = Instant::now() + FENCE_WAIT;
         let mut seen = self.fence.seen.lock().expect("fence");
         while *seen < seq {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -252,16 +306,41 @@ fn reconcile(
     }
 }
 
-/// Starts the operating system watcher on a root, recursively. Returns None when it cannot be started.
+/// The index's own fence folder for a root, made and emptied of fences an earlier process left. None when
+/// it cannot be made, or when it is inside the root, where it would be a folder in the person's project.
 ///
 /// @param root - the root
+fn own_fence_folder(root: &Path) -> Option<PathBuf> {
+    let folder = crate::store::index_folder(root).join("fence");
+    std::fs::create_dir_all(&folder).ok()?;
+    let folder =
+        std::fs::canonicalize(&folder).map(|p| crate::index::strip_verbatim(&p)).unwrap_or(folder);
+    if folder.starts_with(root) {
+        return None;
+    }
+    for entry in std::fs::read_dir(&folder).ok()?.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(FENCE_PREFIX) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Some(folder)
+}
+
+/// Starts the operating system watcher on a root, recursively, and on a fence folder outside it. The fence
+/// folder is watched first: FSEvents restarts its stream for each folder added, and nothing of the root
+/// can be lost while only the fence folder is watched. Answers the watcher and whether the fence folder
+/// is watched; None when the root cannot be.
+///
+/// @param root - the root
+/// @param apart - a fence folder outside the root, if there is one
 /// @param dirty - where events are recorded
 /// @param fence - where fence events are recorded
 fn watch(
     root: &Path,
+    apart: Option<&Path>,
     dirty: Arc<Mutex<Dirty>>,
     fence: Arc<FenceSeen>,
-) -> Option<RecommendedWatcher> {
+) -> Option<(RecommendedWatcher, bool)> {
     let base = root.to_path_buf();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
         let Ok(event) = result else {
@@ -274,8 +353,10 @@ fn watch(
         record_event(&base, &event, &dirty, &fence);
     })
     .ok()?;
+    let watched_apart =
+        apart.is_some_and(|folder| watcher.watch(folder, RecursiveMode::NonRecursive).is_ok());
     watcher.watch(root, RecursiveMode::Recursive).ok()?;
-    Some(watcher)
+    Some((watcher, watched_apart))
 }
 
 /// Records one event's paths in the dirty set, and a fence file's creation as arrived.
@@ -296,6 +377,7 @@ fn record_event(root: &Path, event: &notify::Event, dirty: &Mutex<Dirty>, fence:
             }
             continue;
         }
+        fence.root_events.fetch_add(1, Ordering::SeqCst);
         let Some(rel) = files::relative(root, path) else { continue };
         if rel.split('/').any(|part| VCS_FOLDERS.contains(&part)) {
             continue;

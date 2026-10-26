@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.2
+
+A folder that is not a git repository no longer gets a file written into it. The freshness gate used
+to write `atrius-index-fence-<n>` into the root of such a folder on every query and remove it up to
+250 ms later, so a sync client, a build watcher or another editor saw a file come and go, a listing
+could count it, and a copy could fail on it (Unluminous `task-2370`). A checkout with `.git` is
+unchanged: its fence is in `.git`.
+
+- The fence of a folder with no `.git` is written in `<index folder>/fence` and that folder is added to
+  the same watcher. `Freshness::fence_folder` says where the fences go.
+- On Windows the fence folder has its own `ReadDirectoryChangesW` handle, so a batch of the root's events
+  can arrive after the fence's. The gate counts the root's events and writes another fence when any
+  arrived between writing a fence and seeing it. A fence with none in between means every event from
+  before it has arrived. On Linux and macOS the order across watches already holds.
+- When the index folder cannot be made or watched, the fence goes in the root as before.
+- The freshness test runs on a folder with no git as well, with forty bursts of 50 files each searched
+  at once, while a thread lists the folder and fails if a fence appears. The same test with the fence in
+  the root fails; with one fence a query and no repeat it passed three runs out of three, while about 45
+  queries a run would have repeated the fence.
+
 ## 0.3.1
 
 No file is read into memory whole when it is larger than 32 MB (`exact::LARGEST_HELD`). A macOS hang

@@ -68,8 +68,9 @@ the median query took 0.5 to 17 ms in the index and 16 to 232 ms through ripgrep
   already installed with `inillucent setup-embeddings`.
 - It does not change your files. The index lives in the user's cache folder. The only file it writes
   inside a checkout is an empty fence file in `.git`, which git ignores, created and removed within a
-  query to learn that the watcher has delivered every earlier event. [Architecture](architecture.md)
-  explains the fence.
+  query to learn that the watcher has delivered every earlier event. A folder with no `.git` gets
+  nothing at all: its fence is written in the index folder. [Architecture](architecture.md) explains
+  the fence.
 
 ## Where to go next
 

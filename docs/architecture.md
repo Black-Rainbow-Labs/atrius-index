@@ -163,7 +163,7 @@ answer is that nothing matches. That cutoff was chosen by measurement; see [Lab 
 ```mermaid
 flowchart TB
     E["file events from the watcher"] -->|"mark only"| D["dirty set:<br/>files, folders, whole trees"]
-    Q["a query arrives"] --> FE["write a fence file in .git,<br/>wait for its event"]
+    Q["a query arrives"] --> FE["write a fence file in .git<br/>or the index folder,<br/>wait for its event"]
     FE --> R["list each dirty folder again,<br/>read each changed file again"]
     D --> R
     R --> U["update postings, symbols, chunks"]
@@ -180,6 +180,13 @@ flowchart TB
   the watcher's thread reads it a little later. The gate writes an empty fence file and waits up to
   250 ms for its event. Events arrive in order, so once the fence's event arrives, every earlier event
   has too. The fence goes inside `.git`, where git ignores unknown files and the index never looks.
+- **A folder with no `.git` keeps its fence in the index folder**, in `fence` beside `index.rdb`,
+  added to the same watcher. Nothing is written into the folder itself. Linux delivers every watch
+  through one inotify descriptor and macOS through one FSEvents stream, so the order still holds.
+  Windows gives each watched folder a handle of its own, so a batch of the folder's events can arrive
+  after the fence. The gate counts the folder's events, and writes another fence when any arrived
+  between writing a fence and seeing it. A fence with none in between means every earlier event has
+  arrived. The gate still gives up after 250 ms and reconciles the whole tree.
 - **A branch switch or a burst of thousands of files** marks whole trees, and the gate reconciles them.
   The [freshness test](testing.md) changes a checkout in seven ways and checks every answer against
   ripgrep with no pause.
