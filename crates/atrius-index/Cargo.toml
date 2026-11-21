@@ -12,6 +12,10 @@ readme = "../../README.md"
 keywords = ["search", "index", "ripgrep", "mcp", "code"]
 categories = ["command-line-utilities", "development-tools", "text-processing"]
 
+[features]
+# Phase counters for the performance benchmark; see `src/phases.rs`. Off in every release.
+phases = []
+
 [dependencies]
 # The one file per checkout everything is kept in. `docs/architecture.md` describes the schema.
 inillucent-driver.workspace = true

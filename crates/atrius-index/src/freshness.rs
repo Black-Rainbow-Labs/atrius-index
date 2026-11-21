@@ -65,6 +65,26 @@ struct FenceSeen {
     root_events: AtomicU64,
 }
 
+/// What a gate took from the watcher before it touches the index: the dirty set as it was once every
+/// event from before the gate began had arrived, and whether the fence proved that.
+pub struct Pending {
+    dirty: Dirty,
+    fenced: bool,
+    started: Instant,
+}
+
+impl Pending {
+    /// Whether nothing changed: the fence arrived and no file, folder or overflow is dirty, so the index
+    /// already agrees with the files and the gate needs no write to it.
+    pub fn is_clean(&self) -> bool {
+        self.fenced
+            && !self.dirty.overflow
+            && self.dirty.files.is_empty()
+            && self.dirty.folders.is_empty()
+            && self.dirty.trees.is_empty()
+    }
+}
+
 /// The watcher and the dirty set of one root.
 pub struct Freshness {
     root: PathBuf,
@@ -74,6 +94,13 @@ pub struct Freshness {
     /// Whether the fence folder is outside the root, watched through a handle of its own.
     fence_apart: bool,
     next_fence: AtomicU64,
+    /// This watcher's own part of a fence file's name, after the shared prefix. Another host watching the
+    /// same checkout writes fences into the same `.git` folder, and a fence of its with a higher number
+    /// used to be taken for this watcher's own, so a gate went on before its own fence had arrived.
+    tag: Arc<String>,
+    /// On macOS, the kqueue that proves freshness with no fence once it is armed (`kq.rs`).
+    #[cfg(target_os = "macos")]
+    kqueue: Option<Arc<crate::kq::Kqueue>>,
     _watcher: Option<RecommendedWatcher>,
 }
 
@@ -102,10 +129,11 @@ impl Freshness {
     pub fn start(root: &Path) -> Freshness {
         let dirty = Arc::new(Mutex::new(Dirty { overflow: false, ..Dirty::default() }));
         let fence = Arc::new(FenceSeen::default());
+        let tag = Arc::new(fence_tag());
         let git = root.join(".git");
         let apart = if git.is_dir() { None } else { own_fence_folder(root) };
         let (watcher, fence_apart) =
-            match watch(root, apart.as_deref(), Arc::clone(&dirty), Arc::clone(&fence)) {
+            match watch(root, apart.as_deref(), Arc::clone(&dirty), Arc::clone(&fence), Arc::clone(&tag)) {
                 Some((watcher, watched_apart)) => (Some(watcher), watched_apart),
                 None => (None, false),
             };
@@ -126,6 +154,9 @@ impl Freshness {
             fence_folder,
             fence_apart,
             next_fence: AtomicU64::new(1),
+            tag,
+            #[cfg(target_os = "macos")]
+            kqueue: watcher.as_ref().and_then(|_| crate::kq::Kqueue::start(root)),
             _watcher: watcher,
         }
     }
@@ -133,6 +164,16 @@ impl Freshness {
     /// Where the fence files are written: `.git`, the index's own `fence` folder, or the root.
     pub fn fence_folder(&self) -> &Path {
         &self.fence_folder
+    }
+
+    /// How the gate proves freshness now: `kqueue` once the kqueue is armed and confirmed, `fence`
+    /// otherwise.
+    pub fn proof(&self) -> &'static str {
+        #[cfg(target_os = "macos")]
+        if self.kqueue.as_ref().is_some_and(|kq| kq.is_active()) {
+            return "kqueue";
+        }
+        "fence"
     }
 
     /// Whether anything is waiting to be reconciled.
@@ -170,7 +211,7 @@ impl Freshness {
     /// @param deadline - when to stop waiting
     fn one_fence(&self, deadline: Instant) -> bool {
         let seq = self.next_fence.fetch_add(1, Ordering::SeqCst);
-        let path = self.fence_folder.join(format!("{FENCE_PREFIX}{seq}"));
+        let path = self.fence_folder.join(format!("{FENCE_PREFIX}{}{seq}", self.tag));
         if std::fs::write(&path, b"").is_err() {
             return false;
         }
@@ -192,9 +233,109 @@ impl Freshness {
     ///
     /// @param exact - the in-memory index
     pub fn gate(&self, exact: &mut Exact) -> GateReport {
+        let pending = self.begin();
+        self.finish(pending, exact)
+    }
+
+    /// The first half of the gate, which needs no access to the index: waits for the fence, then takes
+    /// the dirty set. Every event from before this call is in what it answers.
+    pub fn begin(&self) -> Pending {
         let started = Instant::now();
-        let fenced = self.fence();
+        let fenced = self.prove();
         let dirty = std::mem::take(&mut *self.dirty.lock().expect("dirty"));
+        Pending { dirty, fenced, started }
+    }
+
+    /// Proves that every change from before this call is in the dirty set: by draining the kqueue when it
+    /// is armed and confirmed, and by a fence otherwise. Answers whether the proof held.
+    fn prove(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(kq) = self.kqueue.as_ref().filter(|kq| kq.is_on()) {
+            let confirming = kq.is_confirming();
+            let proved_by_kqueue = kq.is_active();
+            self.mark(kq, kq.drain());
+            if proved_by_kqueue {
+                return true;
+            }
+            let fenced = self.fence();
+            if fenced && confirming {
+                kq.confirm();
+            }
+            return fenced;
+        }
+        self.fence()
+    }
+
+    /// Adds what the kqueue's notes say to the dirty set, the way `record_event` adds an FSEvents hint. A
+    /// folder that changed is listed again, and any child folder of it with no descriptor yet is new: it
+    /// and every folder under it get descriptors before the gate lists them, so nothing created in them
+    /// afterwards is missed, and it is reconciled as a tree.
+    ///
+    /// @param kq - the kqueue
+    /// @param changes - the notes drained from it
+    #[cfg(target_os = "macos")]
+    fn mark(&self, kq: &crate::kq::Kqueue, changes: Vec<crate::kq::Change>) {
+        if changes.is_empty() {
+            return;
+        }
+        let mut d = self.dirty.lock().expect("dirty");
+        for change in changes {
+            let parent = change.rel.rsplit_once('/').map(|(p, _)| p.to_owned()).unwrap_or_default();
+            if change.folder && !change.gone {
+                for child in kq.new_child_folders(&change.rel) {
+                    for folder in files::walk_folders(&self.root, &self.root.join(&child), None) {
+                        kq.register(&folder, true);
+                    }
+                    d.trees.insert(child);
+                }
+                d.folders.insert(change.rel);
+                continue;
+            }
+            if change.gone {
+                d.trees.insert(change.rel.clone());
+            }
+            if !change.rel.is_empty() {
+                d.files.insert(change.rel);
+                d.folders.insert(parent);
+            }
+        }
+    }
+
+    /// Gives every file the gate just read a descriptor, then checks its size and time once more: a write
+    /// between the read and the registration posted no note, and it is caught here for the next gate.
+    /// Paths that left the set are forgotten.
+    ///
+    /// @param report - what the gate changed
+    #[cfg(target_os = "macos")]
+    fn register_read(&self, report: &GateReport) {
+        let Some(kq) = self.kqueue.as_ref().filter(|kq| kq.is_on()) else { return };
+        for path in &report.removed_paths {
+            kq.forget_under(path);
+        }
+        let mut moved = Vec::new();
+        for (_, record, _) in &report.changed {
+            kq.register(&record.rel, false);
+            let now = std::fs::metadata(self.root.join(&record.rel)).ok();
+            if now.is_none_or(|m| m.len() != record.size || files::mtime_of(&m) != record.mtime_ns) {
+                moved.push(record.rel.clone());
+            }
+        }
+        if !moved.is_empty() {
+            let mut d = self.dirty.lock().expect("dirty");
+            for rel in moved {
+                d.folders.insert(rel.rsplit_once('/').map(|(p, _)| p.to_owned()).unwrap_or_default());
+                d.files.insert(rel);
+            }
+        }
+    }
+
+    /// The second half of the gate: makes the index agree with everything the dirty set names, or with
+    /// the whole tree when the fence did not arrive or the watcher lost events.
+    ///
+    /// @param pending - what [`Freshness::begin`] took
+    /// @param exact - the in-memory index
+    pub fn finish(&self, pending: Pending, exact: &mut Exact) -> GateReport {
+        let Pending { dirty, fenced, started } = pending;
         let mut report = GateReport { fenced, ..GateReport::default() };
         if dirty.overflow || !fenced {
             reconcile(&self.root, &self.root, None, exact, &HashSet::new(), &mut report);
@@ -223,6 +364,8 @@ impl Freshness {
                 );
             }
         }
+        #[cfg(target_os = "macos")]
+        self.register_read(&report);
         report.took = started.elapsed();
         report
     }
@@ -306,6 +449,18 @@ fn reconcile(
     }
 }
 
+/// A fence name part no other watcher has: this process's id and the time this watcher started, so two
+/// hosts of one checkout, or two indexes in one process, never take each other's fences for their own.
+fn fence_tag() -> String {
+    static STARTED: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let count = STARTED.fetch_add(1, Ordering::SeqCst);
+    format!("{}x{nanos:x}x{count}-", std::process::id())
+}
+
 /// The index's own fence folder for a root, made and emptied of fences an earlier process left. None when
 /// it cannot be made, or when it is inside the root, where it would be a folder in the person's project.
 ///
@@ -335,11 +490,13 @@ fn own_fence_folder(root: &Path) -> Option<PathBuf> {
 /// @param apart - a fence folder outside the root, if there is one
 /// @param dirty - where events are recorded
 /// @param fence - where fence events are recorded
+/// @param tag - this watcher's part of a fence file's name
 fn watch(
     root: &Path,
     apart: Option<&Path>,
     dirty: Arc<Mutex<Dirty>>,
     fence: Arc<FenceSeen>,
+    tag: Arc<String>,
 ) -> Option<(RecommendedWatcher, bool)> {
     let base = root.to_path_buf();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
@@ -350,7 +507,7 @@ fn watch(
         if event.need_rescan() {
             dirty.lock().expect("dirty").overflow = true;
         }
-        record_event(&base, &event, &dirty, &fence);
+        record_event(&base, &event, &dirty, &fence, &tag);
     })
     .ok()?;
     let watched_apart =
@@ -365,12 +522,22 @@ fn watch(
 /// @param event - the event
 /// @param dirty - the dirty set
 /// @param fence - the fence
-fn record_event(root: &Path, event: &notify::Event, dirty: &Mutex<Dirty>, fence: &FenceSeen) {
+/// @param tag - this watcher's part of a fence file's name; a fence with another tag is another host's
+fn record_event(
+    root: &Path,
+    event: &notify::Event,
+    dirty: &Mutex<Dirty>,
+    fence: &FenceSeen,
+    tag: &str,
+) {
     let mut d = dirty.lock().expect("dirty");
     for path in &event.paths {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        if let Some(seq) = name.strip_prefix(FENCE_PREFIX).and_then(|s| s.parse::<u64>().ok()) {
-            if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Any) {
+        if let Some(rest) = name.strip_prefix(FENCE_PREFIX) {
+            let ours = rest.strip_prefix(tag).and_then(|s| s.parse::<u64>().ok());
+            if let Some(seq) = ours.filter(|_| {
+                matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Any)
+            }) {
                 let mut seen = fence.seen.lock().expect("fence");
                 *seen = (*seen).max(seq);
                 fence.arrived.notify_all();

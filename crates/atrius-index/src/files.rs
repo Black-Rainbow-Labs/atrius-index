@@ -93,6 +93,41 @@ pub fn walk_under(root: &Path, start: &Path, depth: Option<usize>) -> Vec<Found>
     collect(builder, root)
 }
 
+/// The folders of the set's walk under one folder of the root, the start included, relative to the root
+/// and sorted. A folder an ignore rule leaves out is not walked, so it is not here. For the kqueue that
+/// watches every folder the set can change in (`kq.rs`).
+///
+/// @param root - the root
+/// @param start - the folder inside the root to start at
+/// @param depth - how deep to go, None for all the way
+pub fn walk_folders(root: &Path, start: &Path, depth: Option<usize>) -> Vec<String> {
+    let Ok(inside) = start.strip_prefix(root) else { return Vec::new() };
+    let below = inside.components().count();
+    let mut builder = walker(root, root, depth.map(|d| d + below));
+    let wanted = start.to_path_buf();
+    builder.filter_entry(move |entry| {
+        let path = entry.path();
+        wanted.starts_with(path) || path.starts_with(&wanted)
+    });
+    let found = Mutex::new(Vec::new());
+    builder.build_parallel().run(|| {
+        let (found, start) = (&found, start);
+        Box::new(move |entry| {
+            let Ok(entry) = entry else { return WalkState::Continue };
+            let folder = entry.file_type().is_some_and(|t| t.is_dir());
+            if folder && entry.path().starts_with(start) {
+                if let Some(rel) = relative(root, entry.path()) {
+                    found.lock().expect("the walk's list").push(rel);
+                }
+            }
+            WalkState::Continue
+        })
+    });
+    let mut found = found.into_inner().expect("the walk finished");
+    found.sort();
+    found
+}
+
 /// Runs a walk and answers the files it found, sorted by path.
 ///
 /// @param builder - the walk

@@ -43,6 +43,7 @@ Deleting an index folder while no host runs is safe. The next query builds it ag
 |---|---|---|
 | `ATRIUS_IDLE_MINUTES` | `120` | How long a host started by a one off command lives with no query. `0` keeps it until `atrius stop` |
 | `ATRIUS_READY_WAIT_SECONDS` | `30` | How long `def`, `refs`, `outline`, `fragment` and `files` wait for an index that is still being built before refusing |
+| `ATRIUS_KQUEUE` | on, macOS only | `off` makes the freshness gate write a fence and wait for FSEvents on every query instead of draining a kqueue. A root on a volume that is not local, or one that needs more than half the file descriptors the process may open, uses the fence anyway |
 
 ### Plain English search
 

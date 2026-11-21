@@ -55,6 +55,8 @@ pub struct Status {
     pub gates: u64,
     /// How many files gates have read again.
     pub reindexed: u64,
+    /// How many gates went on without their fence arriving, and reconciled the whole tree instead.
+    pub unfenced_gates: u64,
     /// The last store error, if any.
     pub store_error: Option<String>,
     /// How many chunks the passage table holds, once it is built.
@@ -80,7 +82,8 @@ pub struct Index {
     exact: Arc<RwLock<Option<Exact>>>,
     symbols: Arc<RwLock<Option<SymbolTable>>>,
     freshness: Freshness,
-    gate_lock: Mutex<()>,
+    /// Held by one gate at a time, with when the last gate that completed began.
+    gate_lock: Mutex<Option<Instant>>,
     last_gate: Mutex<Duration>,
     compacting: Arc<std::sync::atomic::AtomicBool>,
     store: Sender<StoreJob>,
@@ -167,12 +170,17 @@ impl Index {
             exact,
             symbols,
             freshness,
-            gate_lock: Mutex::new(()),
+            gate_lock: Mutex::new(None),
             last_gate: Mutex::new(Duration::ZERO),
             compacting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             store: tx,
             status,
         }
+    }
+
+    /// How the gate proves freshness now: `kqueue` or `fence`.
+    pub fn proof(&self) -> &'static str {
+        self.freshness.proof()
     }
 
     /// The root this index covers.
@@ -219,11 +227,32 @@ impl Index {
 
     /// Runs the gate, so the index agrees with the files as they are now, and hands what changed to the
     /// store thread. Returns None while the index is not loaded yet.
+    ///
+    /// **One gate serves every query that arrived before it began** (`task-2696`). Gates run one at a
+    /// time; a query that waited while another gate ran finds that a gate began after it arrived and has
+    /// finished, which proves everything that query must see, so it does not fence again. **The index is
+    /// written only when something changed**: the fence and the dirty set are read with no lock on the
+    /// index, and the exclusive lock is taken only to reconcile, so searches go on meanwhile.
     pub fn gate(&self) -> Option<GateReport> {
-        let _one_at_a_time = self.gate_lock.lock().expect("gate");
+        let arrived = Instant::now();
+        let mut last_began = self.gate_lock.lock().expect("gate");
+        if self.exact.read().expect("exact").is_none() {
+            return None;
+        }
+        if last_began.is_some_and(|began| began >= arrived) {
+            return Some(GateReport { fenced: true, ..GateReport::default() });
+        }
+        let began = Instant::now();
+        let pending = self.freshness.begin();
+        if pending.is_clean() {
+            *last_began = Some(began);
+            lock(&self.status).gates += 1;
+            return Some(GateReport { fenced: true, took: began.elapsed(), ..GateReport::default() });
+        }
         let mut guard = self.exact.write().expect("exact");
         let exact = guard.as_mut()?;
-        let report = self.freshness.gate(exact);
+        let report = self.freshness.finish(pending, exact);
+        *last_began = Some(began);
         // Read before the table's lock is taken, so a reader that only tries the lock (the window's
         // completion, on every keystroke) is never kept waiting while files are read.
         let read: Vec<(String, symbols::Read)> = report
@@ -267,6 +296,7 @@ impl Index {
         let mut status = lock(&self.status);
         status.gates += 1;
         status.reindexed += report.changed.len() as u64;
+        status.unfenced_gates += u64::from(!report.fenced);
         Some(report)
     }
 
@@ -278,6 +308,9 @@ impl Index {
         let gate_started = Instant::now();
         let gated = self.gate();
         *self.last_gate.lock().expect("last gate") = gate_started.elapsed();
+        if crate::phases::ENABLED {
+            crate::phases::stop(crate::phases::Phase::Gate, Some(gate_started));
+        }
         if gated.is_none() {
             return direct::scan(&self.root, request).map(|a| (a, "none"));
         }

@@ -122,7 +122,10 @@ fn open_database(path: &Path, frames: usize) -> Result<Database, String> {
 pub const BUILD_FRAMES: usize = 1024;
 
 /// How many rows one page of a load reads.
-const LOAD_PAGE: usize = 1024;
+const LOAD_PAGE: usize = 1 << 20;
+/// How many rows of file content a page of the load reads: fewer than [`LOAD_PAGE`], because one row holds
+/// a whole file, so a page stays at tens of megabytes.
+const BLOB_PAGE: usize = 8192;
 
 /// Runs a query a page of rows at a time and hands each row over, so a load never holds the whole of a
 /// table's result beside what is built from it (Unluminous `task-2279`: a window that loaded its index
@@ -152,6 +155,67 @@ fn in_pages(
             return Ok(());
         }
     }
+}
+
+/// Every file record, each with its blocks. The `file` and `blob` tables are each read in pages in their
+/// own key order and matched in memory by content hash (`task-2696`). Reading them joined, in pages ordered
+/// by file id, sorted the whole join again for every page: on Linux's 89,670 files that one read took many
+/// minutes and spilled its sort to the disk.
+///
+/// @param session - a session on the index file
+/// @param next_id - the next file id, which bounds the ids
+fn load_files(session: &inillucent_driver::Connection<'_>, next_id: usize) -> Result<Vec<Option<FileRecord>>, String> {
+    let mut files: Vec<Option<FileRecord>> = vec![None; next_id];
+    let mut wanting: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+    in_pages(session, "SELECT id, path, size, mtime_ns, content_hash, is_binary, line_count FROM file WHERE id > ?1 ORDER BY id", |row| {
+        let int = |i: usize| match row.get(i) {
+            Some(Value::Integer(v)) => *v,
+            _ => 0,
+        };
+        let id = int(0) as usize;
+        if id >= files.len() {
+            files.resize(id + 1, None);
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(row.get(4).and_then(Value::bytes).unwrap_or(&[0; 32]).get(..32).unwrap_or(&[0; 32]));
+        wanting.entry(hash).or_default().push(id);
+        files[id] = Some(FileRecord {
+            rel: row.get(1).and_then(Value::text).unwrap_or_default().to_owned(),
+            size: int(2) as u64,
+            mtime_ns: int(3),
+            hash,
+            blocks: Vec::new(),
+            binary: int(5) != 0,
+            lines: int(6) as u32,
+        });
+    })?;
+    let mut after: Vec<u8> = Vec::new();
+    loop {
+        let rows = session
+            .query("SELECT content_hash, bytes FROM blob WHERE content_hash > ?1 ORDER BY content_hash", &[Value::Blob(after.clone())], BLOB_PAGE)
+            .map_err(|e| e.to_string())?;
+        for row in &rows.rows {
+            let key = row.first().and_then(Value::bytes).unwrap_or_default();
+            after = key.to_vec();
+            let Some(ids) = key.get(..32).and_then(|k| wanting.remove(k)) else { continue };
+            let blocks = unpack_blocks(row.get(1).and_then(Value::bytes).unwrap_or_default());
+            for id in ids {
+                if let Some(record) = files[id].take() {
+                    files[id] = Some(FileRecord { blocks: blocks.clone(), ..record }.held_to_its_first_nul());
+                }
+            }
+        }
+        if rows.rows.len() < BLOB_PAGE {
+            break;
+        }
+    }
+    // A file whose blob is missing was dropped by the join before; it is dropped here the same way.
+    for ids in wanting.into_values() {
+        for id in ids {
+            files[id] = None;
+        }
+    }
+    Ok(files)
 }
 
 /// How many 32 KiB pages the index file's buffer pool holds once the index is loaded or built: 128,
@@ -443,31 +507,7 @@ impl Store {
                 }
             }
         }
-        let mut files: Vec<Option<FileRecord>> = vec![None; next_id];
-        in_pages(&session, "SELECT f.id, f.path, f.size, f.mtime_ns, f.content_hash, f.is_binary, f.line_count, b.bytes FROM file f JOIN blob b ON b.content_hash = f.content_hash WHERE f.id > ?1 ORDER BY f.id", |row| {
-            let int = |i: usize| match row.get(i) {
-                Some(Value::Integer(v)) => *v,
-                _ => 0,
-            };
-            let id = int(0) as usize;
-            if id >= files.len() {
-                files.resize(id + 1, None);
-            }
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(
-                row.get(4).and_then(Value::bytes).unwrap_or(&[0; 32]).get(..32).unwrap_or(&[0; 32]),
-            );
-            files[id] = Some(FileRecord {
-                rel: row.get(1).and_then(Value::text).unwrap_or_default().to_owned(),
-                size: int(2) as u64,
-                mtime_ns: int(3),
-                hash,
-                blocks: unpack_blocks(row.get(7).and_then(Value::bytes).unwrap_or_default()),
-                binary: int(5) != 0,
-                lines: int(6) as u32,
-            }
-            .held_to_its_first_nul());
-        })?;
+        let files = load_files(&session, next_id)?;
         Ok(Exact::restore(files, postings))
     }
 }

@@ -98,6 +98,7 @@ pub fn answer(index: &Index, verb: &str, args: &Map<String, Value>) -> Result<Va
         let seconds = std::env::var("ATRIUS_READY_WAIT_SECONDS").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(30);
         index.wait_for_symbols(std::time::Duration::from_secs(seconds));
     }
+    let answering = crate::phases::start();
     let (resolved, note) = resolve_path(index, args);
     let args = &resolved;
     let mut value = match verb {
@@ -122,6 +123,7 @@ pub fn answer(index: &Index, verb: &str, args: &Map<String, Value>) -> Result<Va
         let text = value["text"].as_str().unwrap_or_default().to_owned();
         value["text"] = Value::String(format!("{note}\n{text}"));
     }
+    crate::phases::stop(crate::phases::Phase::Answer, answering);
     Ok(value)
 }
 
@@ -293,7 +295,9 @@ fn find(index: &Index, args: &Map<String, Value>) -> Result<Value, Refusal> {
     {
         return semantic(index, &asked);
     }
+    let timed = crate::phases::start();
     let mut value = found_value(&asked, &found, engine, started.elapsed(), index.last_gate());
+    crate::phases::stop(crate::phases::Phase::Shape, timed);
     let files: std::collections::BTreeSet<&str> =
         found.hits.iter().map(|h| h.path.as_str()).collect();
     if asked.budget > 0
@@ -581,6 +585,8 @@ fn status(index: &Index) -> Value {
         "memoryBytes": bytes,
         "gates": st.gates,
         "reindexed": st.reindexed,
+        "unfencedGates": st.unfenced_gates,
+        "freshness": index.proof(),
         "passages": st.passages,
         "passagesReady": st.passages_ready,
         "vectors": st.vectors,
@@ -590,6 +596,7 @@ fn status(index: &Index) -> Value {
         "storeError": st.store_error,
         "indexFile": st.file.to_string_lossy(),
         "versions": { "schema": crate::store::SCHEMA_VERSION, "trigram": crate::store::TRIGRAM_VERSION },
+        "phases": crate::phases::take(),
         "text": text,
     })
 }

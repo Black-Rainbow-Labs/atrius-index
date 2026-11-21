@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+A saved index loads in seconds instead of minutes, and on macOS a query no longer waits for the file
+watcher (`task-2696`, from the performance TDD of `task-2695`). Neither change has been through the
+benchmark's keep rule yet; the climb was stopped before its baseline window finished.
+
+- **Loading.** `Store::load_exact` and `Store::load_symbols` read their tables in pages of 1,048,576 rows,
+  8,192 for file contents, instead of 1,024, and `file` and `blob` are read on their own and matched by
+  content hash instead of joined. A page cost time in proportion to where it started in the table, so the
+  load grew with the square of the row count. Timed with `examples/loadtime.rs` on the same saved index:
+  ai-service 2.98 s to 0.29 s, inillucent 0.64 s to 0.21 s, Linux from more than 105 minutes to 14.7 s.
+- **A kqueue gate on macOS** (`src/kq.rs`). Every file and folder of the set is opened with `O_EVTONLY` on
+  one kqueue, and once that is armed and one fence has confirmed it, the gate drains the kqueue with a
+  zero timeout instead of writing a fence and waiting for FSEvents. A note is posted inside the writer's
+  own system call, so a change made before the query is always in the drain. The FSEvents fence took a
+  median of 10.75 ms on an M6; the drain takes 0.011 ms. A probe with the writer in another process saw
+  500 of 500 for each of an in place write, an append, a truncate, a write through `mmap`, a create, a
+  delete, a rename over a file, a folder rename, `clonefile` and `RENAME_SWAP`. A root on a volume that
+  is not local, a root that needs more than half the descriptors the process may open (Linux's tree
+  does), and every root under `ATRIUS_KQUEUE=off` keep the fence. `status` says which with `freshness`.
+- **Two hosts of one checkout no longer take each other's fences.** Every watcher's fence files carry a
+  value of its own, and a fence of another watcher is ignored. Before, a host whose fence numbers were
+  lower than another host's passed its fence before its own event arrived.
+- **The gate takes the write lock only when something changed**, and a query that waited behind another
+  gate does not fence again when that gate began after the query arrived. `status` counts gates whose
+  fence did not arrive as `unfencedGates`.
+- **The benchmark** is `examples/perf.rs`: ripgrep, `atrius-mcp`, `atrius serve` and a one shot
+  `atrius find`, timed from request to answer with the gate and shaping included. Phase counters are in
+  `src/phases.rs` behind the `phases` feature, which no release turns on.
+- New tests: `tests/fences.rs` (500 writes each searched straight after, half from another process;
+  deletes, renames, a new folder and a renamed folder) and `tests/fence_wait.rs` (two indexes of one
+  checkout, and a query that starts while another's fence is pending).
+
 ## 0.3.2
 
 A folder that is not a git repository no longer gets a file written into it. The freshness gate used

@@ -700,7 +700,9 @@ impl Exact {
     /// @param root - the root, for an explicit file the index does not hold
     /// @param request - the pattern, case and scope
     pub fn search(&self, root: &Path, request: &ExactRequest) -> Result<ExactAnswer, String> {
+        let timed = crate::phases::start();
         let matcher = matcher(request.pattern, request.case_insensitive)?;
+        crate::phases::stop(crate::phases::Phase::Matcher, timed);
         if let Some(path) = request.scope.explicit_path(root) {
             return Ok(self.search_explicit(&matcher, &request.scope.path, &path));
         }
@@ -709,7 +711,12 @@ impl Exact {
             .par_iter()
             .flat_map_iter(|&unit| self.verify_block(&matcher, unit))
             .collect();
+        let timed = crate::phases::start();
         hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+        crate::phases::stop(crate::phases::Phase::Sort, timed);
+        crate::phases::count(crate::phases::Count::Searches, 1);
+        crate::phases::count(crate::phases::Count::CandidateBlocks, candidates.len() as u64);
+        crate::phases::count(crate::phases::Count::Hits, hits.len() as u64);
         Ok(ExactAnswer {
             hits,
             in_scope,
@@ -731,11 +738,20 @@ impl Exact {
         };
         if record.is_large() {
             let Some(root) = self.root.as_deref() else { return Vec::new() };
-            return verify_path(matcher, &record.rel, &root.join(&record.rel));
+            let timed = crate::phases::start();
+            let hits = verify_path(matcher, &record.rel, &root.join(&record.rel));
+            crate::phases::stop(crate::phases::Phase::Match, timed);
+            crate::phases::count(crate::phases::Count::BlocksWithHit, u64::from(!hits.is_empty()));
+            return hits;
         }
         let Some(piece) = record.blocks.get(block) else { return Vec::new() };
+        let timed = crate::phases::start();
         let bytes = record.block_bytes(block, self.root.as_deref());
+        crate::phases::stop(crate::phases::Phase::Decompress, timed);
+        let timed = crate::phases::start();
         let mut hits = verify(matcher, &record.rel, &bytes, BinaryDetection::quit(b'\x00'));
+        crate::phases::stop(crate::phases::Phase::Match, timed);
+        crate::phases::count(crate::phases::Count::BlocksWithHit, u64::from(!hits.is_empty()));
         if piece.first_line > 1 {
             for hit in &mut hits {
                 hit.line += u64::from(piece.first_line - 1);
@@ -750,7 +766,9 @@ impl Exact {
     ///
     /// @param request - the pattern, case and scope
     pub fn candidates(&self, request: &ExactRequest) -> Result<(Vec<u32>, usize, bool), String> {
+        let timed = crate::phases::start();
         let query = plan(request.pattern, request.case_insensitive)?;
+        crate::phases::stop(crate::phases::Phase::Plan, timed);
         let unbounded = query == Query::All;
         let everything = request.scope.is_everything();
         let in_scope = if everything {
@@ -759,6 +777,7 @@ impl Exact {
             self.by_path.keys().filter(|rel| request.scope.contains(rel)).count()
         };
         let mut allowed = self.evaluate(&query);
+        let timed = crate::phases::start();
         if query != Query::All {
             // A large file has no trigrams, so no query lets it through, and every search reads it.
             let before = allowed.len();
@@ -784,6 +803,7 @@ impl Exact {
                     .is_some_and(|r| everything || request.scope.contains(&r.rel))
             })
             .collect();
+        crate::phases::stop(crate::phases::Phase::Scope, timed);
         Ok((ids, in_scope, unbounded))
     }
 
@@ -822,7 +842,12 @@ impl Exact {
                 ids.sort_unstable();
                 ids
             }
-            Query::Tri(t) => self.postings.files_with(*t),
+            Query::Tri(t) => {
+                let timed = crate::phases::start();
+                let ids = self.postings.files_with(*t);
+                crate::phases::stop(crate::phases::Phase::Decode, timed);
+                ids
+            }
             Query::And(parts) => {
                 let mut parts: Vec<&Query> = parts.iter().collect();
                 parts.sort_by_key(|q| match q {
@@ -834,14 +859,20 @@ impl Exact {
                     if acc.is_empty() {
                         break;
                     }
-                    acc = intersect(&acc, &self.evaluate(p));
+                    let other = self.evaluate(p);
+                    let timed = crate::phases::start();
+                    acc = intersect(&acc, &other);
+                    crate::phases::stop(crate::phases::Phase::Intersect, timed);
                 }
                 acc
             }
             Query::Or(parts) => {
-                let mut acc: Vec<u32> = parts.iter().flat_map(|p| self.evaluate(p)).collect();
+                let joined: Vec<Vec<u32>> = parts.iter().map(|p| self.evaluate(p)).collect();
+                let timed = crate::phases::start();
+                let mut acc: Vec<u32> = joined.into_iter().flatten().collect();
                 acc.sort_unstable();
                 acc.dedup();
+                crate::phases::stop(crate::phases::Phase::Intersect, timed);
                 acc
             }
         }

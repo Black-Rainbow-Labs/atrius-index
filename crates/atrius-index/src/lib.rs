@@ -16,9 +16,12 @@ pub mod freshness;
 pub mod grammars;
 pub mod host;
 pub mod index;
+#[cfg(target_os = "macos")]
+pub mod kq;
 pub mod lang;
 pub mod outline;
 pub mod passages;
+pub mod phases;
 pub mod paths;
 pub mod plan;
 pub mod protocol;
